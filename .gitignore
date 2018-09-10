@@ -7,10 +7,10 @@
 *.kdev4
 *.ko
 *.log
-*.map
 *.o
 *.pyc
 *.so
+*.so.*
 *.swp
 *.DS_Store
 ut_coverage/
@@ -26,3 +26,4 @@ CONFIG.local
 .cproject
 .settings
 mk/cc.mk
+PYTHON_COMMAND

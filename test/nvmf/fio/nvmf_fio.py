@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from subprocess import check_call, call, check_output, Popen, PIPE
+from subprocess import check_call, call, check_output, Popen, PIPE, CalledProcessError
 import re
 import sys
 import signal
@@ -34,10 +34,12 @@ filename=%(device)s
 
 """
 
+
 def interrupt_handler(signum, frame):
     fio.terminate()
     print "FIO terminated"
     sys.exit(0)
+
 
 def main():
 
@@ -63,7 +65,12 @@ def main():
     print "Found devices: ", devices
 
     # configure_devices(devices)
-    fio_executable = '/usr/bin/fio'
+    try:
+            fio_executable = check_output("which fio", shell=True).split()[0]
+    except CalledProcessError as e:
+            sys.stderr.write(str(e))
+            sys.stderr.write("\nCan't find the fio binary, please install it.\n")
+            sys.exit(1)
 
     device_paths = ['/dev/' + dev for dev in devices]
     print device_paths
@@ -78,9 +85,11 @@ def main():
     sys.stdout.flush()
     sys.exit(rc)
 
+
 def get_target_devices():
     output = check_output('lsblk -l -o NAME', shell=True)
     return re.findall("(nvme[0-9]+n[0-9]+)\n", output)
+
 
 def create_fio_config(size, q_depth, devices, test, run_time, verify):
     if not verify:
@@ -93,12 +102,14 @@ def create_fio_config(size, q_depth, devices, test, run_time, verify):
         fiofile += fio_job_template % {"jobnumber": i, "device": dev}
     return fiofile
 
+
 def set_device_parameter(devices, filename_template, value):
     for dev in devices:
         filename = filename_template % dev
         f = open(filename, 'r+b')
         f.write(value)
         f.close()
+
 
 def configure_devices(devices):
     set_device_parameter(devices, "/sys/block/%s/queue/nomerges", "2")
@@ -116,6 +127,7 @@ def configure_devices(devices):
     else:
         print "Requested queue_depth {} but only {} is supported.".format(str(requested_qd), str(qd))
     set_device_parameter(devices, "/sys/block/%s/queue/scheduler", "noop")
+
 
 if __name__ == "__main__":
     main()

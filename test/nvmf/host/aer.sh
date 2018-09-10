@@ -2,7 +2,7 @@
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/nvmf/common.sh
 
 rpc_py="python $rootdir/scripts/rpc.py"
@@ -19,27 +19,58 @@ fi
 timing_enter aer
 timing_enter start_nvmf_tgt
 
-$NVMF_APP -c $testdir/../nvmf.conf &
+$NVMF_APP -m 0xF --wait-for-rpc &
 nvmfpid=$!
 
 trap "killprocess $nvmfpid; exit 1" SIGINT SIGTERM EXIT
 
-waitforlisten $nvmfpid ${RPC_PORT}
+waitforlisten $nvmfpid
+$rpc_py set_nvmf_target_options -u 8192 -p 4
+$rpc_py start_subsystem_init
 timing_exit start_nvmf_tgt
 
-bdevs="$bdevs $($rpc_py construct_malloc_bdev 64 512)"
-$rpc_py construct_nvmf_subsystem nqn.2016-06.io.spdk:cnode1 "trtype:RDMA traddr:$NVMF_FIRST_TARGET_IP trsvcid:4420" '' -s SPDK00000000000001 -n "$bdevs"
+modprobe -v nvme-rdma
 
-$rootdir/test/lib/nvme/aer/aer -r "\
+$rpc_py construct_malloc_bdev 64 512 --name Malloc0
+$rpc_py construct_nvmf_subsystem nqn.2016-06.io.spdk:cnode1 "trtype:RDMA traddr:$NVMF_FIRST_TARGET_IP trsvcid:$NVMF_PORT" '' -a -s SPDK00000000000001 -n Malloc0 -m 2
+$rpc_py get_nvmf_subsystems
+
+# TODO: this aer test tries to invoke an AER completion by setting the temperature
+#threshold to a very low value.  This does not work with emulated controllers
+#though so currently the test is disabled.
+
+#$rootdir/test/nvme/aer/aer -r "\
+#        trtype:RDMA \
+#        adrfam:IPv4 \
+#        traddr:$NVMF_FIRST_TARGET_IP \
+#        trsvcid:$NVMF_PORT \
+#        subnqn:nqn.2014-08.org.nvmexpress.discovery"
+
+# Namespace Attribute Notice Tests
+$rootdir/test/nvme/aer/aer -r "\
         trtype:RDMA \
         adrfam:IPv4 \
         traddr:$NVMF_FIRST_TARGET_IP \
         trsvcid:$NVMF_PORT \
-        subnqn:nqn.2014-08.org.nvmexpress.discovery"
-sync
+        subnqn:nqn.2016-06.io.spdk:cnode1" -n 2 &
+aerpid=$!
+
+# Waiting for aer start to work
+sleep 5
+
+# Add a new namespace
+$rpc_py construct_malloc_bdev 64 4096 --name Malloc1
+$rpc_py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Malloc1 -n 2
+$rpc_py get_nvmf_subsystems
+
+wait $aerpid
+
+$rpc_py delete_malloc_bdev Malloc0
+$rpc_py delete_malloc_bdev Malloc1
 $rpc_py delete_nvmf_subsystem nqn.2016-06.io.spdk:cnode1
 
 trap - SIGINT SIGTERM EXIT
 
+nvmfcleanup
 killprocess $nvmfpid
 timing_exit aer

@@ -38,6 +38,7 @@ DIRS-y += trace
 DIRS-y += nvmf_tgt
 DIRS-y += iscsi_top
 DIRS-y += iscsi_tgt
+DIRS-y += spdk_tgt
 ifeq ($(OS),Linux)
 DIRS-$(CONFIG_VHOST) += vhost
 endif

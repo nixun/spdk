@@ -56,14 +56,17 @@ static void usage(void)
 static bool
 conns_compare(struct spdk_iscsi_conn *first, struct spdk_iscsi_conn *second)
 {
-	if (first->lcore < second->lcore)
+	if (first->lcore < second->lcore) {
 		return true;
+	}
 
-	if (first->lcore > second->lcore)
+	if (first->lcore > second->lcore) {
 		return false;
+	}
 
-	if (first->id < second->id)
+	if (first->id < second->id) {
 		return true;
+	}
 
 	return false;
 }
@@ -90,8 +93,8 @@ print_connections(void)
 	conns_size = sizeof(*conns) * MAX_ISCSI_CONNECTIONS;
 
 	conns_ptr = mmap(NULL, conns_size, PROT_READ, MAP_SHARED, fd, 0);
-	if (conns_ptr == NULL) {
-		fprintf(stderr, "Cannot mmap shared memory\n");
+	if (conns_ptr == MAP_FAILED) {
+		fprintf(stderr, "Cannot mmap shared memory (%d)\n", errno);
 		exit(1);
 	}
 
@@ -157,7 +160,7 @@ int main(int argc, char **argv)
 
 	history_ptr = mmap(NULL, sizeof(*histories), PROT_READ, MAP_SHARED, history_fd, 0);
 	if (history_ptr == MAP_FAILED) {
-		fprintf(stderr, "Unable to mmap history shm\n");
+		fprintf(stderr, "Unable to mmap history shm (%d).\n", errno);
 		exit(1);
 	}
 

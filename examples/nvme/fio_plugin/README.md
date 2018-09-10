@@ -4,9 +4,9 @@ First, clone the fio source repository from https://github.com/axboe/fio
 
     git clone https://github.com/axboe/fio
 
-Then check out the fio 2.21:
+Then check out the fio 3.3:
 
-    cd fio && git checkout fio-2.21
+    cd fio && git checkout fio-3.3
 
 Finally, compile the code:
 
@@ -70,3 +70,28 @@ engine's full path via the ioengine parameter - LD_PRELOAD is recommended to avo
 When testing random workloads, it is recommended to set norandommap=1.  fio's random map
 processing consumes extra CPU cycles which will degrade performance over time with
 the fio_plugin since all I/O are submitted and completed on a single CPU core.
+
+When testing FIO on multiple NVMe SSDs with SPDK plugin, it is recommended to use multiple jobs in FIO configurion.
+It has been observed that there are some performance gap between FIO(with SPDK plugin enabled) and SPDK perf
+(examples/nvme/perf/perf) on testing multiple NVMe SSDs. If you use one job(i.e., use one CPU core) configured for
+FIO test, the performance is worse than SPDK perf (also using one CPU core) against many NVMe SSDs. But if you use
+multiple jobs for FIO test, the performance of FIO is similiar with SPDK perf. After analyzing this phenomenon, we
+think that is caused by the FIO architecture. Mainly FIO can scale with multiple threads (i.e., using CPU cores),
+but it is not good to use one thread against many I/O devices.
+
+# End-to-end Data Protection (Optional)
+
+Running with PI setting, following settings steps are required.
+First, format device namespace with proper PI setting. For example:
+
+    nvme format /dev/nvme0n1 -l 1 -i 1 -p 0 -m 1
+
+In fio configure file, add PRACT and set PRCHK by flags(GUARD|REFTAG|APPTAG) properly. For example:
+
+    pi_act=0
+    pi_chk=GUARD
+
+Blocksize should be set as the sum of data and metadata. For example, if data blocksize is 512 Byte, host generated
+PI metadata is 8 Byte, then blocksize in fio configure file should be 520 Byte:
+
+    bs=520

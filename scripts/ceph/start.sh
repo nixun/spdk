@@ -4,20 +4,27 @@
 set -x
 set -e
 
-fsid=`uuidgen`
-base_dir=`pwd`
-mon_ip=127.0.0.1
-mon_dir=${base_dir}/ceph/mon.a/
-pid_dir=${base_dir}/ceph/pid
+script_dir=$(readlink -f $(dirname $0))
+
+base_dir=/var/tmp/ceph
+mon_ip=$1
+mon_dir=${base_dir}/mon.a/
+pid_dir=${base_dir}/pid
 ceph_conf=${base_dir}/ceph.conf
-ceph_conf_temp=${base_dir}/ceph.conf.tmp
-mnt_dir=${base_dir}/ceph/mnt
+mnt_dir=${base_dir}/mnt
 dev_backend=/dev/ceph
 image=/var/tmp/ceph_raw.img
 dev=/dev/loop200
-# partition osd
 
-cp $ceph_conf $ceph_conf_temp
+umount $dev || true
+losetup -d $dev_backend || true
+
+# partition osd
+if [ -d $base_dir ]; then
+	rm -rf $base_dir
+fi
+mkdir ${base_dir}
+cp ${script_dir}/ceph.conf $ceph_conf
 
 if [ ! -e $image ]; then
 	fallocate -l 10G $image
@@ -51,26 +58,29 @@ mount /dev/disk/by-partlabel/osd-device-0-data ${mnt_pt}
 echo -e "\tosd data = ${mnt_pt}" >> "$ceph_conf"
 echo -e "\tosd journal = /dev/disk/by-partlabel/osd-device-0-journal" >> "$ceph_conf"
 
+# add mon address
+echo -e "\t[mon.a]" >> "$ceph_conf"
+echo -e "\tmon addr = ${mon_ip}:12046" >> "$ceph_conf"
 
 # create mon
 rm -rf ${mon_dir}/*
 mkdir -p ${mon_dir}
 mkdir -p ${pid_dir}
 
-ceph-authtool --create-keyring --gen-key --name=mon. ${base_dir}/ceph/keyring --cap mon 'allow *'
-ceph-authtool --gen-key --name=client.admin --set-uid=0 --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *' ${base_dir}/ceph/keyring
+ceph-authtool --create-keyring --gen-key --name=mon. ${base_dir}/keyring --cap mon 'allow *'
+ceph-authtool --gen-key --name=client.admin --set-uid=0 --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *' ${base_dir}/keyring
 
-monmaptool --create --clobber --add a ${mon_ip}:12046 --print ${base_dir}/ceph/monmap
+monmaptool --create --clobber --add a ${mon_ip}:12046 --print ${base_dir}/monmap
 
-sh -c "ulimit -c unlimited && exec ceph-mon --mkfs -c ${ceph_conf} -i a --monmap=${base_dir}/ceph/monmap --keyring=${base_dir}/ceph/keyring --mon-data=${mon_dir}"
+sh -c "ulimit -c unlimited && exec ceph-mon --mkfs -c ${ceph_conf} -i a --monmap=${base_dir}/monmap --keyring=${base_dir}/keyring --mon-data=${mon_dir}"
 
-cp ${base_dir}/ceph/keyring ${mon_dir}/keyring
+cp ${base_dir}/keyring ${mon_dir}/keyring
 
 cp $ceph_conf /etc/ceph/ceph.conf
 
-cp ${base_dir}/ceph/keyring /etc/ceph/keyring
+cp ${base_dir}/keyring /etc/ceph/keyring
 
-ceph-run sh -c "ulimit -n 16384 && ulimit -c unlimited && exec ceph-mon -c ${ceph_conf} -i a --keyring=${base_dir}/ceph/keyring --pid-file=${base_dir}/ceph/pid/root@`hostname`.pid --mon-data=${mon_dir}" || true
+ceph-run sh -c "ulimit -n 16384 && ulimit -c unlimited && exec ceph-mon -c ${ceph_conf} -i a --keyring=${base_dir}/keyring --pid-file=${base_dir}/pid/root@`hostname`.pid --mon-data=${mon_dir}" || true
 
 # create osd
 
@@ -90,6 +100,3 @@ sleep 2
 
 mkdir -p ${pid_dir}
 env -i TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=134217728 ceph-osd -c ${ceph_conf} -i 0 --pid-file=${pid_dir}/ceph-osd.0.pid
-
-rm -f $ceph_conf
-mv $ceph_conf_temp $ceph_conf

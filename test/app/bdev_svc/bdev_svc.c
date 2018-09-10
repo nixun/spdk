@@ -37,19 +37,16 @@
 #include "spdk/event.h"
 
 static char g_path[256];
+static bool g_unaffinitize_thread = false;
 
 static void
-usage(char *executable_name)
+bdev_svc_usage(void)
 {
-	printf("%s [options]\n", executable_name);
-	printf("options:\n");
-	printf(" -c config  config file [required]\n");
-	printf(" -i shared memory ID\n");
-	printf(" -m mask    core mask for DPDK\n");
-	printf(" -n channel number of memory channels used for DPDK\n");
-	printf(" -p core    master (primary) core for DPDK\n");
-	printf(" -s size    memory size in MB for DPDK\n");
-	printf(" -H         show this usage\n");
+}
+
+static void
+bdev_svc_parse_arg(int ch, char *arg)
+{
 }
 
 static void
@@ -58,7 +55,9 @@ bdev_svc_start(void *arg1, void *arg2)
 	int fd;
 	int shm_id = (intptr_t)arg1;
 
-	spdk_unaffinitize_thread();
+	if (g_unaffinitize_thread) {
+		spdk_unaffinitize_thread();
+	}
 
 	snprintf(g_path, sizeof(g_path), "/var/run/spdk_bdev%d", shm_id);
 	fd = open(g_path, O_CREAT | O_EXCL | O_RDWR, S_IFREG);
@@ -79,53 +78,35 @@ bdev_svc_shutdown(void)
 int
 main(int argc, char **argv)
 {
-	int ch, rc;
+	int rc;
 	struct spdk_app_opts opts = {};
 
 	/* default value in opts structure */
 	spdk_app_opts_init(&opts);
 
 	opts.name = "bdev_svc";
-
-	while ((ch = getopt(argc, argv, "c:i:m:n:p:s:H")) != -1) {
-		switch (ch) {
-		case 'c':
-			opts.config_file = optarg;
-			break;
-		case 'i':
-			opts.shm_id = atoi(optarg);
-			break;
-		case 'm':
-			opts.reactor_mask = optarg;
-			break;
-		case 'n':
-			opts.mem_channel = atoi(optarg);
-			break;
-		case 'p':
-			opts.master_core = atoi(optarg);
-			break;
-		case 's':
-			opts.mem_size = atoi(optarg);
-			break;
-		case 'H':
-		default:
-			usage(argv[0]);
-			exit(EXIT_SUCCESS);
-		}
-	}
-
-	if (!opts.config_file) {
-		fprintf(stderr, "Configuration file is required.\n");
-		usage(argv[0]);
-		exit(1);
-	}
-
 	opts.shutdown_cb = bdev_svc_shutdown;
 	opts.max_delay_us = 1000 * 1000;
 
-	spdk_app_start(&opts, bdev_svc_start, (void *)(intptr_t)opts.shm_id, NULL);
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "", NULL,
+				      bdev_svc_parse_arg, bdev_svc_usage)) !=
+	    SPDK_APP_PARSE_ARGS_SUCCESS) {
+		exit(rc);
+	}
 
-	rc = spdk_app_fini();
+	/* User did not specify a reactor mask.  Test scripts may do this when using
+	 *  bdev_svc as a primary process to speed up nvme test programs by running
+	 *  them as secondary processes.  In that case, we will unaffinitize the thread
+	 *  in the bdev_svc_start routine, which will allow the scheduler to move this
+	 *  thread so it doesn't conflict with pinned threads in the secondary processes.
+	 */
+	if (opts.reactor_mask == NULL) {
+		g_unaffinitize_thread = true;
+	}
+
+	rc = spdk_app_start(&opts, bdev_svc_start, (void *)(intptr_t)opts.shm_id, NULL);
+
+	spdk_app_fini();
 
 	return rc;
 }

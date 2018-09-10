@@ -9,12 +9,8 @@
   ImmediateData Yes
   ErrorRecoveryLevel 0
 
-[Rpc]
-  Enable Yes
-
 [Nvme]
   RetryCount 4
-  Timeout 0
   ActionOnTimeout None
   AdminPollRate 100000
   HotplugEnable Yes

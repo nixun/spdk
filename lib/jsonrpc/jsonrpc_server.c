@@ -52,7 +52,7 @@ capture_val(const struct spdk_json_val *val, void *out)
 }
 
 static const struct spdk_json_object_decoder jsonrpc_request_decoders[] = {
-	{"jsonrpc", offsetof(struct jsonrpc_request, version), capture_val},
+	{"jsonrpc", offsetof(struct jsonrpc_request, version), capture_val, true},
 	{"method", offsetof(struct jsonrpc_request, method), capture_val},
 	{"params", offsetof(struct jsonrpc_request, params), capture_val, true},
 	{"id", offsetof(struct jsonrpc_request, id), capture_val, true},
@@ -71,8 +71,8 @@ parse_single_request(struct spdk_jsonrpc_request *request, struct spdk_json_val 
 		goto done;
 	}
 
-	if (!req.version || req.version->type != SPDK_JSON_VAL_STRING ||
-	    !spdk_json_strequal(req.version, "2.0")) {
+	if (req.version && (req.version->type != SPDK_JSON_VAL_STRING ||
+			    !spdk_json_strequal(req.version, "2.0"))) {
 		invalid = true;
 	}
 
@@ -90,7 +90,7 @@ parse_single_request(struct spdk_jsonrpc_request *request, struct spdk_json_val 
 				request->id.len = req.id->len;
 				memcpy(request->id.start, req.id->start, req.id->len);
 			} else {
-				SPDK_TRACELOG(SPDK_TRACE_RPC, "JSON-RPC request id too long (%u)\n",
+				SPDK_DEBUGLOG(SPDK_LOG_RPC, "JSON-RPC request id too long (%u)\n",
 					      req.id->len);
 				invalid = true;
 			}
@@ -132,7 +132,7 @@ spdk_jsonrpc_parse_request(struct spdk_jsonrpc_server_conn *conn, void *json, si
 
 	request = calloc(1, sizeof(*request));
 	if (request == NULL) {
-		SPDK_TRACELOG(SPDK_TRACE_RPC, "Out of memory allocating request\n");
+		SPDK_DEBUGLOG(SPDK_LOG_RPC, "Out of memory allocating request\n");
 		return -1;
 	}
 
@@ -144,9 +144,17 @@ spdk_jsonrpc_parse_request(struct spdk_jsonrpc_server_conn *conn, void *json, si
 	request->id.type = SPDK_JSON_VAL_INVALID;
 	request->send_offset = 0;
 	request->send_len = 0;
+	request->send_buf_size = SPDK_JSONRPC_SEND_BUF_SIZE_INIT;
+	request->send_buf = malloc(request->send_buf_size);
+	if (request->send_buf == NULL) {
+		SPDK_ERRLOG("Failed to allocate send_buf (%zu bytes)\n", request->send_buf_size);
+		conn->outstanding_requests--;
+		free(request);
+		return -1;
+	}
 
 	if (rc < 0 || rc > SPDK_JSONRPC_MAX_VALUES) {
-		SPDK_TRACELOG(SPDK_TRACE_RPC, "JSON parse error\n");
+		SPDK_DEBUGLOG(SPDK_LOG_RPC, "JSON parse error\n");
 		spdk_jsonrpc_server_handle_error(request, SPDK_JSONRPC_ERROR_PARSE_ERROR);
 
 		/*
@@ -160,7 +168,7 @@ spdk_jsonrpc_parse_request(struct spdk_jsonrpc_server_conn *conn, void *json, si
 	rc = spdk_json_parse(json, size, conn->values, SPDK_JSONRPC_MAX_VALUES, &end,
 			     SPDK_JSON_PARSE_FLAG_DECODE_IN_PLACE);
 	if (rc < 0 || rc > SPDK_JSONRPC_MAX_VALUES) {
-		SPDK_TRACELOG(SPDK_TRACE_RPC, "JSON parse error on second pass\n");
+		SPDK_DEBUGLOG(SPDK_LOG_RPC, "JSON parse error on second pass\n");
 		spdk_jsonrpc_server_handle_error(request, SPDK_JSONRPC_ERROR_PARSE_ERROR);
 		return -1;
 	}
@@ -170,10 +178,10 @@ spdk_jsonrpc_parse_request(struct spdk_jsonrpc_server_conn *conn, void *json, si
 	if (conn->values[0].type == SPDK_JSON_VAL_OBJECT_BEGIN) {
 		parse_single_request(request, conn->values);
 	} else if (conn->values[0].type == SPDK_JSON_VAL_ARRAY_BEGIN) {
-		SPDK_TRACELOG(SPDK_TRACE_RPC, "Got batch array (not currently supported)\n");
+		SPDK_DEBUGLOG(SPDK_LOG_RPC, "Got batch array (not currently supported)\n");
 		spdk_jsonrpc_server_handle_error(request, SPDK_JSONRPC_ERROR_INVALID_REQUEST);
 	} else {
-		SPDK_TRACELOG(SPDK_TRACE_RPC, "top-level JSON value was not array or object\n");
+		SPDK_DEBUGLOG(SPDK_LOG_RPC, "top-level JSON value was not array or object\n");
 		spdk_jsonrpc_server_handle_error(request, SPDK_JSONRPC_ERROR_INVALID_REQUEST);
 	}
 
@@ -184,10 +192,30 @@ static int
 spdk_jsonrpc_server_write_cb(void *cb_ctx, const void *data, size_t size)
 {
 	struct spdk_jsonrpc_request *request = cb_ctx;
+	size_t new_size = request->send_buf_size;
 
-	if (SPDK_JSONRPC_SEND_BUF_SIZE - request->send_len < size) {
-		SPDK_ERRLOG("Not enough space in send buf\n");
-		return -1;
+	while (new_size - request->send_len < size) {
+		if (new_size >= SPDK_JSONRPC_SEND_BUF_SIZE_MAX) {
+			SPDK_ERRLOG("Send buf exceeded maximum size (%zu)\n",
+				    (size_t)SPDK_JSONRPC_SEND_BUF_SIZE_MAX);
+			return -1;
+		}
+
+		new_size *= 2;
+	}
+
+	if (new_size != request->send_buf_size) {
+		uint8_t *new_buf;
+
+		new_buf = realloc(request->send_buf, new_size);
+		if (new_buf == NULL) {
+			SPDK_ERRLOG("Resizing send_buf failed (current size %zu, new size %zu)\n",
+				    request->send_buf_size, new_size);
+			return -1;
+		}
+
+		request->send_buf = new_buf;
+		request->send_buf_size = new_size;
 	}
 
 	memcpy(request->send_buf + request->send_len, data, size);
@@ -217,18 +245,26 @@ begin_response(struct spdk_jsonrpc_request *request)
 }
 
 static void
+skip_response(struct spdk_jsonrpc_request *request)
+{
+	request->send_len = 0;
+	spdk_jsonrpc_server_send_response(request);
+}
+
+static void
 end_response(struct spdk_jsonrpc_request *request, struct spdk_json_write_ctx *w)
 {
 	spdk_json_write_object_end(w);
 	spdk_json_write_end(w);
 	spdk_jsonrpc_server_write_cb(request, "\n", 1);
-	spdk_jsonrpc_server_send_response(request->conn, request);
+	spdk_jsonrpc_server_send_response(request);
 }
 
 void
 spdk_jsonrpc_free_request(struct spdk_jsonrpc_request *request)
 {
 	request->conn->outstanding_requests--;
+	free(request->send_buf);
 	free(request);
 }
 
@@ -239,13 +275,13 @@ spdk_jsonrpc_begin_result(struct spdk_jsonrpc_request *request)
 
 	if (request->id.type == SPDK_JSON_VAL_INVALID) {
 		/* Notification - no response required */
-		spdk_jsonrpc_free_request(request);
+		skip_response(request);
 		return NULL;
 	}
 
 	w = begin_response(request);
 	if (w == NULL) {
-		spdk_jsonrpc_free_request(request);
+		skip_response(request);
 		return NULL;
 	}
 
@@ -275,7 +311,7 @@ spdk_jsonrpc_send_error_response(struct spdk_jsonrpc_request *request,
 
 	w = begin_response(request);
 	if (w == NULL) {
-		free(request);
+		skip_response(request);
 		return;
 	}
 
@@ -290,4 +326,35 @@ spdk_jsonrpc_send_error_response(struct spdk_jsonrpc_request *request,
 	end_response(request, w);
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("rpc", SPDK_TRACE_RPC)
+void
+spdk_jsonrpc_send_error_response_fmt(struct spdk_jsonrpc_request *request,
+				     int error_code, const char *fmt, ...)
+{
+	struct spdk_json_write_ctx *w;
+	va_list args;
+
+	if (request->id.type == SPDK_JSON_VAL_INVALID) {
+		/* For error responses, if id is missing, explicitly respond with "id": null. */
+		request->id.type = SPDK_JSON_VAL_NULL;
+	}
+
+	w = begin_response(request);
+	if (w == NULL) {
+		skip_response(request);
+		return;
+	}
+
+	spdk_json_write_name(w, "error");
+	spdk_json_write_object_begin(w);
+	spdk_json_write_name(w, "code");
+	spdk_json_write_int32(w, error_code);
+	spdk_json_write_name(w, "message");
+	va_start(args, fmt);
+	spdk_json_write_string_fmt_v(w, fmt, args);
+	va_end(args);
+	spdk_json_write_object_end(w);
+
+	end_response(request, w);
+}
+
+SPDK_LOG_REGISTER_COMPONENT("rpc", SPDK_LOG_RPC)

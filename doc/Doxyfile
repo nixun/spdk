@@ -730,7 +730,7 @@ WARNINGS               = YES
 # will automatically be disabled.
 # The default value is: YES.
 
-WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_UNDOCUMENTED   = NO
 
 # If the WARN_IF_DOC_ERROR tag is set to YES, doxygen will generate warnings for
 # potential errors in the documentation, such as not documenting some parameters
@@ -782,19 +782,54 @@ WARN_LOGFILE           =
 
 INPUT                  = ../include/spdk \
                          index.md \
-                         directory_structure.md \
-                         memory.md \
-                         porting.md \
+
+# This list contains the top level pages listed in index.md.  This list should
+# remain in the same order as the contents of index.md.  The order here also
+# determines the order of these sections in the left-side navigation bar.
+INPUT                  += \
+                         intro.md \
+                         concepts.md \
+                         user_guides.md \
+                         prog_guides.md \
+                         general.md \
+                         misc.md \
+                         driver_modules.md \
+                         tools.md \
+                         experimental_tools.md \
+                         performance_reports.md \
+
+# All remaining pages are listed here in alphabetical order by filename.
+INPUT                  += \
+                         about.md \
+                         applications.md \
+                         bdev.md \
+                         bdev_module.md \
+                         bdev_pg.md \
                          blob.md \
                          blobfs.md \
-                         bdev.md \
+                         changelog.md \
+                         concurrency.md \
+                         directory_structure.md \
                          event.md \
+                         getting_started.md \
                          ioat.md \
                          iscsi.md \
+                         jsonrpc.md \
+                         lvol.md \
+                         memory.md \
                          nvme.md \
                          nvme-cli.md \
                          nvmf.md \
-                         vhost.md
+                         nvmf_tgt_pg.md \
+                         peer_2_peer.md \
+                         porting.md \
+                         spdkcli.md \
+                         ssd_internals.md \
+                         userspace.md \
+                         vagrant.md \
+                         vhost.md \
+                         vhost_processing.md \
+                         virtio.md
 
 # This tag can be used to specify the character encoding of the source files
 # that doxygen parses. Internally doxygen uses the UTF-8 encoding. Doxygen uses
@@ -891,7 +926,7 @@ EXAMPLE_RECURSIVE      = NO
 # that contain images that are to be included in the documentation (see the
 # \image command).
 
-IMAGE_PATH             =
+IMAGE_PATH             = img
 
 # The INPUT_FILTER tag can be used to specify a program that doxygen should
 # invoke to filter for each input file. Doxygen will invoke the filter program
@@ -1148,7 +1183,7 @@ HTML_EXTRA_STYLESHEET  = stylesheet.css
 # files will be copied as-is; there are no commands or markers available.
 # This tag requires that the tag GENERATE_HTML is set to YES.
 
-HTML_EXTRA_FILES       =
+HTML_EXTRA_FILES       = two.min.js
 
 # The HTML_COLORSTYLE_HUE tag controls the color of the HTML output. Doxygen
 # will adjust the colors in the style sheet and background images according to
@@ -1424,7 +1459,7 @@ DISABLE_INDEX          = NO
 # The default value is: NO.
 # This tag requires that the tag GENERATE_HTML is set to YES.
 
-GENERATE_TREEVIEW      = NO
+GENERATE_TREEVIEW      = YES
 
 # The ENUM_VALUES_PER_LINE tag can be used to set the number of enum values that
 # doxygen will group on one line in the generated HTML documentation.
@@ -1538,7 +1573,7 @@ MATHJAX_CODEFILE       =
 # The default value is: YES.
 # This tag requires that the tag GENERATE_HTML is set to YES.
 
-SEARCHENGINE           = NO
+SEARCHENGINE           = YES
 
 # When the SERVER_BASED_SEARCH tag is enabled the search engine will be
 # implemented using a web server instead of a web client using Javascript. There

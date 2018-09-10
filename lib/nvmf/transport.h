@@ -39,11 +39,10 @@
 #include "spdk/nvme.h"
 #include "spdk/nvmf.h"
 
-struct spdk_nvmf_listen_addr;
-
 struct spdk_nvmf_transport {
 	struct spdk_nvmf_tgt			*tgt;
 	const struct spdk_nvmf_transport_ops	*ops;
+	struct spdk_nvmf_transport_opts		opts;
 
 	TAILQ_ENTRY(spdk_nvmf_transport)	link;
 };
@@ -55,9 +54,9 @@ struct spdk_nvmf_transport_ops {
 	enum spdk_nvme_transport_type type;
 
 	/**
-	 * Create a transport for the given target
+	 * Create a transport for the given transport opts
 	 */
-	struct spdk_nvmf_transport *(*create)(struct spdk_nvmf_tgt *tgt);
+	struct spdk_nvmf_transport *(*create)(struct spdk_nvmf_transport_opts *opts);
 
 	/**
 	 * Destroy the transport
@@ -80,36 +79,41 @@ struct spdk_nvmf_transport_ops {
 	/**
 	 * Check for new connections on the transport.
 	 */
-	void (*accept)(struct spdk_nvmf_transport *transport);
+	void (*accept)(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn);
 
 	/**
 	 * Fill out a discovery log entry for a specific listen address.
 	 */
-	void (*listen_addr_discover)(struct spdk_nvmf_transport *transport,
-				     struct spdk_nvmf_listen_addr *listen_addr,
-				     struct spdk_nvmf_discovery_log_page_entry *entry);
+	void (*listener_discover)(struct spdk_nvmf_transport *transport,
+				  struct spdk_nvme_transport_id *trid,
+				  struct spdk_nvmf_discovery_log_page_entry *entry);
 
 	/**
 	 * Create a new poll group
 	 */
-	struct spdk_nvmf_poll_group *(*poll_group_create)(struct spdk_nvmf_transport *transport);
+	struct spdk_nvmf_transport_poll_group *(*poll_group_create)(struct spdk_nvmf_transport *transport);
 
 	/**
 	 * Destroy a poll group
 	 */
-	void (*poll_group_destroy)(struct spdk_nvmf_poll_group *group);
+	void (*poll_group_destroy)(struct spdk_nvmf_transport_poll_group *group);
 
 	/**
 	 * Add a qpair to a poll group
 	 */
-	int (*poll_group_add)(struct spdk_nvmf_poll_group *group,
+	int (*poll_group_add)(struct spdk_nvmf_transport_poll_group *group,
 			      struct spdk_nvmf_qpair *qpair);
 
 	/**
-	 * Remove a qpair from a poll group
+	 * Poll the group to process I/O
 	 */
-	int (*poll_group_remove)(struct spdk_nvmf_poll_group *group,
-				 struct spdk_nvmf_qpair *qpair);
+	int (*poll_group_poll)(struct spdk_nvmf_transport_poll_group *group);
+
+	/*
+	 * Free the request without sending a response
+	 * to the originator. Release memory tied to this request.
+	 */
+	int (*req_free)(struct spdk_nvmf_request *req);
 
 	/*
 	 * Signal request completion, which sends a response
@@ -123,18 +127,21 @@ struct spdk_nvmf_transport_ops {
 	void (*qpair_fini)(struct spdk_nvmf_qpair *qpair);
 
 	/*
-	 * Poll a connection for events.
-	 */
-	int (*qpair_poll)(struct spdk_nvmf_qpair *qpair);
-
-	/*
 	 * True if the qpair has no pending IO.
 	 */
 	bool (*qpair_is_idle)(struct spdk_nvmf_qpair *qpair);
+
+	/*
+	 * Get the remote transport ID for the queue pair
+	 */
+	int (*qpair_get_peer_trid)(struct spdk_nvmf_qpair *qpair,
+				   struct spdk_nvme_transport_id *trid);
 };
 
 struct spdk_nvmf_transport *spdk_nvmf_transport_create(struct spdk_nvmf_tgt *tgt,
-		enum spdk_nvme_transport_type type);
+		enum spdk_nvme_transport_type type,
+		struct spdk_nvmf_transport_opts *opts);
+
 int spdk_nvmf_transport_destroy(struct spdk_nvmf_transport *transport);
 
 int spdk_nvmf_transport_listen(struct spdk_nvmf_transport *transport,
@@ -143,30 +150,32 @@ int spdk_nvmf_transport_listen(struct spdk_nvmf_transport *transport,
 int spdk_nvmf_transport_stop_listen(struct spdk_nvmf_transport *transport,
 				    const struct spdk_nvme_transport_id *trid);
 
-void spdk_nvmf_transport_accept(struct spdk_nvmf_transport *transport);
+void spdk_nvmf_transport_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn);
 
-void spdk_nvmf_transport_listen_addr_discover(struct spdk_nvmf_transport *transport,
-		struct spdk_nvmf_listen_addr *listen_addr,
+void spdk_nvmf_transport_listener_discover(struct spdk_nvmf_transport *transport,
+		struct spdk_nvme_transport_id *trid,
 		struct spdk_nvmf_discovery_log_page_entry *entry);
 
-struct spdk_nvmf_poll_group *spdk_nvmf_transport_poll_group_create(struct spdk_nvmf_transport
-		*transport);
+struct spdk_nvmf_transport_poll_group *spdk_nvmf_transport_poll_group_create(
+	struct spdk_nvmf_transport *transport);
 
-void spdk_nvmf_transport_poll_group_destroy(struct spdk_nvmf_poll_group *group);
+void spdk_nvmf_transport_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group);
 
-int spdk_nvmf_transport_poll_group_add(struct spdk_nvmf_poll_group *group,
+int spdk_nvmf_transport_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 				       struct spdk_nvmf_qpair *qpair);
 
-int spdk_nvmf_transport_poll_group_remove(struct spdk_nvmf_poll_group *group,
-		struct spdk_nvmf_qpair *qpair);
+int spdk_nvmf_transport_poll_group_poll(struct spdk_nvmf_transport_poll_group *group);
+
+int spdk_nvmf_transport_req_free(struct spdk_nvmf_request *req);
 
 int spdk_nvmf_transport_req_complete(struct spdk_nvmf_request *req);
 
 void spdk_nvmf_transport_qpair_fini(struct spdk_nvmf_qpair *qpair);
 
-int spdk_nvmf_transport_qpair_poll(struct spdk_nvmf_qpair *qpair);
-
 bool spdk_nvmf_transport_qpair_is_idle(struct spdk_nvmf_qpair *qpair);
+
+int spdk_nvmf_transport_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
+		struct spdk_nvme_transport_id *trid);
 
 extern const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma;
 

@@ -50,21 +50,20 @@ spdk_scsi_init(void)
 	return 0;
 }
 
-int
+void
 spdk_scsi_fini(void)
 {
 	pthread_mutex_destroy(&g_spdk_scsi.mutex);
-	return 0;
 }
 
 SPDK_TRACE_REGISTER_FN(scsi_trace)
 {
 	spdk_trace_register_owner(OWNER_SCSI_DEV, 'd');
 	spdk_trace_register_object(OBJECT_SCSI_TASK, 't');
-	spdk_trace_register_description("SCSI TASK DONE", "", TRACE_SCSI_TASK_DONE,
-					OWNER_SCSI_DEV, OBJECT_SCSI_TASK, 0, 0, 0, "");
-	spdk_trace_register_description("SCSI TASK START", "", TRACE_SCSI_TASK_START,
-					OWNER_SCSI_DEV, OBJECT_SCSI_TASK, 0, 0, 0, "");
+	spdk_trace_register_description("SCSI_TASK_DONE", "", TRACE_SCSI_TASK_DONE,
+					OWNER_SCSI_DEV, OBJECT_SCSI_TASK, 0, 0, "");
+	spdk_trace_register_description("SCSI_TASK_START", "", TRACE_SCSI_TASK_START,
+					OWNER_SCSI_DEV, OBJECT_SCSI_TASK, 0, 0, "");
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("scsi", SPDK_TRACE_SCSI)
+SPDK_LOG_REGISTER_COMPONENT("scsi", SPDK_LOG_SCSI)

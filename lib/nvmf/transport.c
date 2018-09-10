@@ -33,16 +33,13 @@
 
 #include "spdk/stdinc.h"
 
+#include "nvmf_internal.h"
 #include "transport.h"
 
 #include "spdk/log.h"
 #include "spdk/nvmf.h"
 #include "spdk/queue.h"
 #include "spdk/util.h"
-
-#include "ctrlr.h"
-#include "nvmf_internal.h"
-#include "request.h"
 
 static const struct spdk_nvmf_transport_ops *const g_transport_ops[] = {
 #ifdef SPDK_CONFIG_RDMA
@@ -52,36 +49,66 @@ static const struct spdk_nvmf_transport_ops *const g_transport_ops[] = {
 
 #define NUM_TRANSPORTS (SPDK_COUNTOF(g_transport_ops))
 
-struct spdk_nvmf_transport *
-spdk_nvmf_transport_create(struct spdk_nvmf_tgt *tgt,
-			   enum spdk_nvme_transport_type type)
+static inline const struct spdk_nvmf_transport_ops *
+spdk_nvmf_get_transport_ops(enum spdk_nvme_transport_type type)
 {
 	size_t i;
-	const struct spdk_nvmf_transport_ops *ops = NULL;
-	struct spdk_nvmf_transport *transport;
-
 	for (i = 0; i != NUM_TRANSPORTS; i++) {
 		if (g_transport_ops[i]->type == type) {
-			ops = g_transport_ops[i];
-			break;
+			return g_transport_ops[i];
 		}
 	}
+	return NULL;
+}
 
+struct spdk_nvmf_transport *
+spdk_nvmf_transport_create(struct spdk_nvmf_tgt *tgt,
+			   enum spdk_nvme_transport_type type,
+			   struct spdk_nvmf_transport_opts *opts)
+{
+	const struct spdk_nvmf_transport_ops *ops = NULL;
+	struct spdk_nvmf_transport *transport;
+	struct spdk_nvmf_transport_opts tgt_opts;
+
+	if (opts == NULL) {
+		/* get transport opts from global target opts */
+		tgt_opts.max_queue_depth = tgt->opts.max_queue_depth;
+		tgt_opts.max_qpairs_per_ctrlr = tgt->opts.max_qpairs_per_ctrlr;
+		tgt_opts.in_capsule_data_size = tgt->opts.in_capsule_data_size;
+		tgt_opts.max_io_size = tgt->opts.max_io_size;
+		tgt_opts.io_unit_size = tgt->opts.io_unit_size;
+		tgt_opts.max_aq_depth = tgt->opts.max_queue_depth;
+		opts = &tgt_opts;
+	}
+
+	if ((opts->max_io_size % opts->io_unit_size != 0) ||
+	    (opts->max_io_size / opts->io_unit_size >
+	     SPDK_NVMF_MAX_SGL_ENTRIES)) {
+		SPDK_ERRLOG("%s: invalid IO size, MaxIO:%d, UnitIO:%d, MaxSGL:%d\n",
+			    spdk_nvme_transport_id_trtype_str(type),
+			    opts->max_io_size,
+			    opts->io_unit_size,
+			    SPDK_NVMF_MAX_SGL_ENTRIES);
+		return NULL;
+	}
+
+	ops = spdk_nvmf_get_transport_ops(type);
 	if (!ops) {
 		SPDK_ERRLOG("Transport type %s unavailable.\n",
 			    spdk_nvme_transport_id_trtype_str(type));
 		return NULL;
 	}
 
-	transport = ops->create(tgt);
+	transport = ops->create(opts);
 	if (!transport) {
 		SPDK_ERRLOG("Unable to create new transport of type %s\n",
 			    spdk_nvme_transport_id_trtype_str(type));
 		return NULL;
 	}
 
-	transport->ops = ops;
 	transport->tgt = tgt;
+	transport->ops = ops;
+	transport->opts = *opts;
 
 	return transport;
 }
@@ -107,23 +134,23 @@ spdk_nvmf_transport_stop_listen(struct spdk_nvmf_transport *transport,
 }
 
 void
-spdk_nvmf_transport_accept(struct spdk_nvmf_transport *transport)
+spdk_nvmf_transport_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
 {
-	transport->ops->accept(transport);
+	transport->ops->accept(transport, cb_fn);
 }
 
 void
-spdk_nvmf_transport_listen_addr_discover(struct spdk_nvmf_transport *transport,
-		struct spdk_nvmf_listen_addr *listen_addr,
-		struct spdk_nvmf_discovery_log_page_entry *entry)
+spdk_nvmf_transport_listener_discover(struct spdk_nvmf_transport *transport,
+				      struct spdk_nvme_transport_id *trid,
+				      struct spdk_nvmf_discovery_log_page_entry *entry)
 {
-	transport->ops->listen_addr_discover(transport, listen_addr, entry);
+	transport->ops->listener_discover(transport, trid, entry);
 }
 
-struct spdk_nvmf_poll_group *
+struct spdk_nvmf_transport_poll_group *
 spdk_nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport)
 {
-	struct spdk_nvmf_poll_group *group;
+	struct spdk_nvmf_transport_poll_group *group;
 
 	group = transport->ops->poll_group_create(transport);
 	group->transport = transport;
@@ -132,13 +159,13 @@ spdk_nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport)
 }
 
 void
-spdk_nvmf_transport_poll_group_destroy(struct spdk_nvmf_poll_group *group)
+spdk_nvmf_transport_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 {
 	group->transport->ops->poll_group_destroy(group);
 }
 
 int
-spdk_nvmf_transport_poll_group_add(struct spdk_nvmf_poll_group *group,
+spdk_nvmf_transport_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 				   struct spdk_nvmf_qpair *qpair)
 {
 	if (qpair->transport) {
@@ -154,10 +181,15 @@ spdk_nvmf_transport_poll_group_add(struct spdk_nvmf_poll_group *group,
 }
 
 int
-spdk_nvmf_transport_poll_group_remove(struct spdk_nvmf_poll_group *group,
-				      struct spdk_nvmf_qpair *qpair)
+spdk_nvmf_transport_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
-	return group->transport->ops->poll_group_remove(group, qpair);
+	return group->transport->ops->poll_group_poll(group);
+}
+
+int
+spdk_nvmf_transport_req_free(struct spdk_nvmf_request *req)
+{
+	return req->qpair->transport->ops->req_free(req);
 }
 
 int
@@ -172,14 +204,15 @@ spdk_nvmf_transport_qpair_fini(struct spdk_nvmf_qpair *qpair)
 	qpair->transport->ops->qpair_fini(qpair);
 }
 
-int
-spdk_nvmf_transport_qpair_poll(struct spdk_nvmf_qpair *qpair)
-{
-	return qpair->transport->ops->qpair_poll(qpair);
-}
-
 bool
 spdk_nvmf_transport_qpair_is_idle(struct spdk_nvmf_qpair *qpair)
 {
 	return qpair->transport->ops->qpair_is_idle(qpair);
+}
+
+int
+spdk_nvmf_transport_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
+					struct spdk_nvme_transport_id *trid)
+{
+	return qpair->transport->ops->qpair_get_peer_trid(qpair, trid);
 }

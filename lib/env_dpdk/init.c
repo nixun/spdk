@@ -35,6 +35,8 @@
 
 #include "env_internal.h"
 
+#include "spdk/version.h"
+
 #include <rte_config.h>
 #include <rte_eal.h>
 
@@ -44,6 +46,9 @@
 #define SPDK_ENV_DPDK_DEFAULT_MASTER_CORE	-1
 #define SPDK_ENV_DPDK_DEFAULT_MEM_CHANNEL	-1
 #define SPDK_ENV_DPDK_DEFAULT_CORE_MASK		"0x1"
+
+static char **eal_cmdline;
+static int eal_cmdline_argcount;
 
 static char *
 _sprintf_alloc(const char *format, ...)
@@ -95,6 +100,45 @@ _sprintf_alloc(const char *format, ...)
 	return NULL;
 }
 
+#if RTE_VERSION >= RTE_VERSION_NUM(18, 05, 0, 0)
+const char *eal_get_runtime_dir(void);
+#endif
+
+static void
+spdk_env_unlink_shared_files(void)
+{
+	char buffer[PATH_MAX];
+
+#if RTE_VERSION < RTE_VERSION_NUM(18, 05, 0, 0)
+	snprintf(buffer, PATH_MAX, "/var/run/.spdk_pid%d_hugepage_info", getpid());
+	if (unlink(buffer)) {
+		fprintf(stderr, "Unable to unlink shared memory file: %s. Error code: %d\n", buffer, errno);
+	}
+#else
+	DIR *dir;
+	struct dirent *d;
+
+	dir = opendir(eal_get_runtime_dir());
+	if (!dir) {
+		fprintf(stderr, "Failed to open DPDK runtime dir: %s (%d)\n", eal_get_runtime_dir(), errno);
+		return;
+	}
+
+	while ((d = readdir(dir)) != NULL) {
+		if (d->d_type != DT_REG) {
+			continue;
+		}
+
+		snprintf(buffer, PATH_MAX, "%s/%s", eal_get_runtime_dir(), d->d_name);
+		if (unlink(buffer)) {
+			fprintf(stderr, "Unable to unlink shared memory file: %s. Error code: %d\n", buffer, errno);
+		}
+	}
+
+	closedir(dir);
+#endif
+}
+
 void
 spdk_env_opts_init(struct spdk_env_opts *opts)
 {
@@ -117,14 +161,13 @@ spdk_free_args(char **args, int argcount)
 {
 	int i;
 
-	assert(args != NULL);
-
 	for (i = 0; i < argcount; i++) {
-		assert(args[i] != NULL);
 		free(args[i]);
 	}
 
-	free(args);
+	if (argcount) {
+		free(args);
+	}
 }
 
 static char **
@@ -133,6 +176,8 @@ spdk_push_arg(char *args[], int *argcount, char *arg)
 	char **tmp;
 
 	if (arg == NULL) {
+		fprintf(stderr, "%s: NULL arg supplied\n", __func__);
+		spdk_free_args(args, *argcount);
 		return NULL;
 	}
 
@@ -148,17 +193,19 @@ spdk_push_arg(char *args[], int *argcount, char *arg)
 	return tmp;
 }
 
+static void
+spdk_destruct_eal_cmdline(void)
+{
+	spdk_free_args(eal_cmdline, eal_cmdline_argcount);
+}
+
+
 static int
-spdk_build_eal_cmdline(const struct spdk_env_opts *opts, char **out[])
+spdk_build_eal_cmdline(const struct spdk_env_opts *opts)
 {
 	int argcount = 0;
 	char **args;
 
-	if (out == NULL) {
-		return -1;
-	}
-
-	*out = NULL;
 	args = NULL;
 
 	/* set the program name */
@@ -167,8 +214,28 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts, char **out[])
 		return -1;
 	}
 
+	/* disable shared configuration files when in single process mode. This allows for cleaner shutdown */
+	if (opts->shm_id < 0) {
+		args = spdk_push_arg(args, &argcount, _sprintf_alloc("%s", "--no-shconf"));
+		if (args == NULL) {
+			return -1;
+		}
+	}
+
 	/* set the coremask */
-	args = spdk_push_arg(args, &argcount, _sprintf_alloc("-c %s", opts->core_mask));
+	/* NOTE: If coremask starts with '[' and ends with ']' it is a core list
+	 */
+	if (opts->core_mask[0] == '[') {
+		char *l_arg = _sprintf_alloc("-l %s", opts->core_mask + 1);
+		int len = strlen(l_arg);
+		if (l_arg[len - 1] == ']') {
+			l_arg[len - 1] = '\0';
+		}
+		args = spdk_push_arg(args, &argcount, l_arg);
+	} else {
+		args = spdk_push_arg(args, &argcount, _sprintf_alloc("-c %s", opts->core_mask));
+	}
+
 	if (args == NULL) {
 		return -1;
 	}
@@ -182,7 +249,7 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts, char **out[])
 	}
 
 	/* set the memory size */
-	if (opts->mem_size > 0) {
+	if (opts->mem_size >= 0) {
 		args = spdk_push_arg(args, &argcount, _sprintf_alloc("-m %d", opts->mem_size));
 		if (args == NULL) {
 			return -1;
@@ -206,6 +273,47 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts, char **out[])
 		}
 	}
 
+	/* create just one hugetlbfs file */
+	if (opts->hugepage_single_segments) {
+		args = spdk_push_arg(args, &argcount, _sprintf_alloc("--single-file-segments"));
+		if (args == NULL) {
+			return -1;
+		}
+	}
+
+	/* unlink hugepages after initialization */
+	if (opts->unlink_hugepage) {
+		args = spdk_push_arg(args, &argcount, _sprintf_alloc("--huge-unlink"));
+		if (args == NULL) {
+			return -1;
+		}
+	}
+
+#if RTE_VERSION >= RTE_VERSION_NUM(18, 05, 0, 0) && RTE_VERSION < RTE_VERSION_NUM(18, 8, 0, 0)
+	/* SPDK holds off with using the new memory management model just yet */
+	args = spdk_push_arg(args, &argcount, _sprintf_alloc("--legacy-mem"));
+	if (args == NULL) {
+		return -1;
+	}
+#endif
+
+	if (opts->num_pci_addr) {
+		size_t i;
+		char bdf[32];
+		struct spdk_pci_addr *pci_addr =
+				opts->pci_blacklist ? opts->pci_blacklist : opts->pci_whitelist;
+
+		for (i = 0; i < opts->num_pci_addr; i++) {
+			spdk_pci_addr_fmt(bdf, 32, &pci_addr[i]);
+			args = spdk_push_arg(args, &argcount, _sprintf_alloc("%s=%s",
+					     (opts->pci_blacklist ? "--pci-blacklist" : "--pci-whitelist"),
+					     bdf));
+			if (args == NULL) {
+				return -1;
+			}
+		}
+	}
+
 #ifdef __linux__
 	if (opts->shm_id < 0) {
 		args = spdk_push_arg(args, &argcount, _sprintf_alloc("--file-prefix=spdk_pid%d",
@@ -220,8 +328,13 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts, char **out[])
 			return -1;
 		}
 
-		/* set the base virtual address */
-		args = spdk_push_arg(args, &argcount, _sprintf_alloc("--base-virtaddr=0x1000000000"));
+		/* Set the base virtual address - it must be an address that is not in the
+		 * ASAN shadow region, otherwise ASAN-enabled builds will ignore the
+		 * mmap hint.
+		 *
+		 * Ref: https://github.com/google/sanitizers/wiki/AddressSanitizerAlgorithm
+		 */
+		args = spdk_push_arg(args, &argcount, _sprintf_alloc("--base-virtaddr=0x200000000000"));
 		if (args == NULL) {
 			return -1;
 		}
@@ -234,28 +347,31 @@ spdk_build_eal_cmdline(const struct spdk_env_opts *opts, char **out[])
 	}
 #endif
 
-	*out = args;
+	eal_cmdline = args;
+	eal_cmdline_argcount = argcount;
+	if (atexit(spdk_destruct_eal_cmdline) != 0) {
+		fprintf(stderr, "Failed to register cleanup handler\n");
+	}
 
 	return argcount;
 }
 
-void spdk_env_init(const struct spdk_env_opts *opts)
+int spdk_env_init(const struct spdk_env_opts *opts)
 {
-	char **args = NULL;
 	char **dpdk_args = NULL;
-	int argcount, i, rc;
+	int i, rc;
 	int orig_optind;
 
-	argcount = spdk_build_eal_cmdline(opts, &args);
-	if (argcount <= 0) {
+	rc = spdk_build_eal_cmdline(opts);
+	if (rc < 0) {
 		fprintf(stderr, "Invalid arguments to initialize DPDK\n");
-		exit(-1);
+		return -1;
 	}
 
-	printf("Starting %s initialization...\n", rte_version());
+	printf("Starting %s / %s initialization...\n", SPDK_VERSION_STRING, rte_version());
 	printf("[ DPDK EAL parameters: ");
-	for (i = 0; i < argcount; i++) {
-		printf("%s ", args[i]);
+	for (i = 0; i < eal_cmdline_argcount; i++) {
+		printf("%s ", eal_cmdline[i]);
 	}
 	printf("]\n");
 
@@ -263,26 +379,45 @@ void spdk_env_init(const struct spdk_env_opts *opts)
 	 * before passing so we can still free the individual strings
 	 * correctly.
 	 */
-	dpdk_args = calloc(argcount, sizeof(char *));
+	dpdk_args = calloc(eal_cmdline_argcount, sizeof(char *));
 	if (dpdk_args == NULL) {
 		fprintf(stderr, "Failed to allocate dpdk_args\n");
-		exit(-1);
+		return -1;
 	}
-	memcpy(dpdk_args, args, sizeof(char *) * argcount);
+	memcpy(dpdk_args, eal_cmdline, sizeof(char *) * eal_cmdline_argcount);
 
 	fflush(stdout);
 	orig_optind = optind;
 	optind = 1;
-	rc = rte_eal_init(argcount, dpdk_args);
+	rc = rte_eal_init(eal_cmdline_argcount, dpdk_args);
 	optind = orig_optind;
 
-	spdk_free_args(args, argcount);
 	free(dpdk_args);
 
 	if (rc < 0) {
 		fprintf(stderr, "Failed to initialize DPDK\n");
-		exit(-1);
+		return -1;
 	}
 
-	spdk_vtophys_register_dpdk_mem();
+	if (opts->shm_id < 0 && !opts->hugepage_single_segments) {
+		/*
+		 * Unlink hugepage and config info files after init.  This will ensure they get
+		 *  deleted on app exit, even if the app crashes and does not exit normally.
+		 *  Only do this when not in multi-process mode, since for multi-process other
+		 *  apps will need to open these files. These files are not created for
+		 *  "single file segments".
+		 */
+		spdk_env_unlink_shared_files();
+	}
+
+	if (spdk_mem_map_init() < 0) {
+		fprintf(stderr, "Failed to allocate mem_map\n");
+		return -1;
+	}
+	if (spdk_vtophys_init() < 0) {
+		fprintf(stderr, "Failed to initialize vtophys\n");
+		return -1;
+	}
+
+	return 0;
 }

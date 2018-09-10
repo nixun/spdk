@@ -37,7 +37,7 @@
 
 #include "spdk_cunit.h"
 
-#include "scsi.c"
+#include "scsi/scsi.c"
 
 static void
 scsi_init(void)
@@ -52,7 +52,7 @@ int
 main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
-	unsigned int 	num_failures;
+	unsigned int	num_failures;
 
 	if (CU_initialize_registry() != CUE_SUCCESS) {
 		return CU_get_error();

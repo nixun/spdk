@@ -1,7 +1,6 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (C) 2008-2012 Daisuke Aoyama <aoyama@peach.ne.jp>.
  *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
@@ -40,16 +39,18 @@
 #include "spdk/endian.h"
 #include "spdk/env.h"
 #include "spdk/copy_engine.h"
-#include "spdk/io_channel.h"
+#include "spdk/json.h"
+#include "spdk/thread.h"
+#include "spdk/queue.h"
 #include "spdk/string.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 
 struct malloc_disk {
-	struct spdk_bdev	disk;
-	void 			*malloc_buf;
-	struct malloc_disk	*next;
+	struct spdk_bdev		disk;
+	void				*malloc_buf;
+	TAILQ_ENTRY(malloc_disk)	link;
 };
 
 struct malloc_task {
@@ -75,7 +76,11 @@ malloc_done(void *ref, int status)
 	struct malloc_task *task = __malloc_task_from_copy_task(ref);
 
 	if (status != 0) {
-		task->status = SPDK_BDEV_IO_STATUS_FAILED;
+		if (status == -ENOMEM) {
+			task->status = SPDK_BDEV_IO_STATUS_NOMEM;
+		} else {
+			task->status = SPDK_BDEV_IO_STATUS_FAILED;
+		}
 	}
 
 	if (--task->num_outstanding == 0) {
@@ -83,12 +88,11 @@ malloc_done(void *ref, int status)
 	}
 }
 
-static struct malloc_disk *g_malloc_disk_head = NULL;
+static TAILQ_HEAD(, malloc_disk) g_malloc_disks = TAILQ_HEAD_INITIALIZER(g_malloc_disks);
 
 int malloc_disk_count = 0;
 
 static int bdev_malloc_initialize(void);
-static void bdev_malloc_finish(void);
 static void bdev_malloc_get_spdk_running_config(FILE *fp);
 
 static int
@@ -97,31 +101,15 @@ bdev_malloc_get_ctx_size(void)
 	return sizeof(struct malloc_task) + spdk_copy_task_size();
 }
 
-SPDK_BDEV_MODULE_REGISTER(malloc, bdev_malloc_initialize, bdev_malloc_finish,
-			  bdev_malloc_get_spdk_running_config, bdev_malloc_get_ctx_size, NULL)
+static struct spdk_bdev_module malloc_if = {
+	.name = "malloc",
+	.module_init = bdev_malloc_initialize,
+	.config_text = bdev_malloc_get_spdk_running_config,
+	.get_ctx_size = bdev_malloc_get_ctx_size,
 
-static void
-bdev_malloc_delete_from_list(struct malloc_disk *malloc_disk)
-{
-	struct malloc_disk *prev = NULL;
-	struct malloc_disk *node = g_malloc_disk_head;
+};
 
-	if (malloc_disk == NULL)
-		return;
-
-	while (node != NULL) {
-		if (node == malloc_disk) {
-			if (prev != NULL) {
-				prev->next = malloc_disk->next;
-			} else {
-				g_malloc_disk_head = malloc_disk->next;
-			}
-			break;
-		}
-		prev = node;
-		node = node->next;
-	}
-}
+SPDK_BDEV_MODULE_REGISTER(&malloc_if)
 
 static void
 malloc_disk_free(struct malloc_disk *malloc_disk)
@@ -139,7 +127,8 @@ static int
 bdev_malloc_destruct(void *ctx)
 {
 	struct malloc_disk *malloc_disk = ctx;
-	bdev_malloc_delete_from_list(malloc_disk);
+
+	TAILQ_REMOVE(&g_malloc_disks, malloc_disk, link);
 	malloc_disk_free(malloc_disk);
 	return 0;
 }
@@ -150,8 +139,9 @@ bdev_malloc_check_iov_len(struct iovec *iovs, int iovcnt, size_t nbytes)
 	int i;
 
 	for (i = 0; i < iovcnt; i++) {
-		if (nbytes < iovs[i].iov_len)
+		if (nbytes < iovs[i].iov_len) {
 			return 0;
+		}
 
 		nbytes -= iovs[i].iov_len;
 	}
@@ -174,7 +164,7 @@ bdev_malloc_readv(struct malloc_disk *mdisk, struct spdk_io_channel *ch,
 		return;
 	}
 
-	SPDK_TRACELOG(SPDK_TRACE_MALLOC, "read %lu bytes from offset %#lx\n",
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV_MALLOC, "read %lu bytes from offset %#lx\n",
 		      len, offset);
 
 	task->status = SPDK_BDEV_IO_STATUS_SUCCESS;
@@ -185,8 +175,8 @@ bdev_malloc_readv(struct malloc_disk *mdisk, struct spdk_io_channel *ch,
 				       ch, iov[i].iov_base,
 				       src, iov[i].iov_len, malloc_done);
 
-		if (res != (int64_t)iov[i].iov_len) {
-			malloc_done(__copy_task_from_malloc_task(task), -1);
+		if (res != 0) {
+			malloc_done(__copy_task_from_malloc_task(task), res);
 		}
 
 		src += iov[i].iov_len;
@@ -209,7 +199,7 @@ bdev_malloc_writev(struct malloc_disk *mdisk, struct spdk_io_channel *ch,
 		return;
 	}
 
-	SPDK_TRACELOG(SPDK_TRACE_MALLOC, "wrote %lu bytes to offset %#lx\n",
+	SPDK_DEBUGLOG(SPDK_LOG_BDEV_MALLOC, "wrote %lu bytes to offset %#lx\n",
 		      len, offset);
 
 	task->status = SPDK_BDEV_IO_STATUS_SUCCESS;
@@ -220,12 +210,11 @@ bdev_malloc_writev(struct malloc_disk *mdisk, struct spdk_io_channel *ch,
 				       ch, dst, iov[i].iov_base,
 				       iov[i].iov_len, malloc_done);
 
-		if (res != (int64_t)iov[i].iov_len) {
-			malloc_done(__copy_task_from_malloc_task(task), -1);
+		if (res != 0) {
+			malloc_done(__copy_task_from_malloc_task(task), res);
 		}
 
 		dst += iov[i].iov_len;
-		len -= iov[i].iov_len;
 	}
 }
 
@@ -236,16 +225,6 @@ bdev_malloc_unmap(struct malloc_disk *mdisk,
 		  uint64_t offset,
 		  uint64_t byte_count)
 {
-	uint64_t lba;
-	uint32_t block_count;
-
-	lba = offset / mdisk->disk.blocklen;
-	block_count = byte_count / mdisk->disk.blocklen;
-
-	if (lba >= mdisk->disk.blockcnt || block_count > mdisk->disk.blockcnt - lba) {
-		return -1;
-	}
-
 	task->status = SPDK_BDEV_IO_STATUS_SUCCESS;
 	task->num_outstanding = 1;
 
@@ -272,14 +251,16 @@ bdev_malloc_reset(struct malloc_disk *mdisk, struct malloc_task *task)
 
 static int _bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
+	uint32_t block_size = bdev_io->bdev->blocklen;
+
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-		if (bdev_io->u.read.iovs[0].iov_base == NULL) {
-			assert(bdev_io->u.read.iovcnt == 1);
-			bdev_io->u.read.iovs[0].iov_base =
+		if (bdev_io->u.bdev.iovs[0].iov_base == NULL) {
+			assert(bdev_io->u.bdev.iovcnt == 1);
+			bdev_io->u.bdev.iovs[0].iov_base =
 				((struct malloc_disk *)bdev_io->bdev->ctxt)->malloc_buf +
-				bdev_io->u.read.offset;
-			bdev_io->u.read.iovs[0].iov_len = bdev_io->u.read.len;
+				bdev_io->u.bdev.offset_blocks * block_size;
+			bdev_io->u.bdev.iovs[0].iov_len = bdev_io->u.bdev.num_blocks * block_size;
 			spdk_bdev_io_complete(spdk_bdev_io_from_ctx(bdev_io->driver_ctx),
 					      SPDK_BDEV_IO_STATUS_SUCCESS);
 			return 0;
@@ -288,20 +269,20 @@ static int _bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_b
 		bdev_malloc_readv((struct malloc_disk *)bdev_io->bdev->ctxt,
 				  ch,
 				  (struct malloc_task *)bdev_io->driver_ctx,
-				  bdev_io->u.read.iovs,
-				  bdev_io->u.read.iovcnt,
-				  bdev_io->u.read.len,
-				  bdev_io->u.read.offset);
+				  bdev_io->u.bdev.iovs,
+				  bdev_io->u.bdev.iovcnt,
+				  bdev_io->u.bdev.num_blocks * block_size,
+				  bdev_io->u.bdev.offset_blocks * block_size);
 		return 0;
 
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		bdev_malloc_writev((struct malloc_disk *)bdev_io->bdev->ctxt,
 				   ch,
 				   (struct malloc_task *)bdev_io->driver_ctx,
-				   bdev_io->u.write.iovs,
-				   bdev_io->u.write.iovcnt,
-				   bdev_io->u.write.len,
-				   bdev_io->u.write.offset);
+				   bdev_io->u.bdev.iovs,
+				   bdev_io->u.bdev.iovcnt,
+				   bdev_io->u.bdev.num_blocks * block_size,
+				   bdev_io->u.bdev.offset_blocks * block_size);
 		return 0;
 
 	case SPDK_BDEV_IO_TYPE_RESET:
@@ -311,15 +292,24 @@ static int _bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_b
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		return bdev_malloc_flush((struct malloc_disk *)bdev_io->bdev->ctxt,
 					 (struct malloc_task *)bdev_io->driver_ctx,
-					 bdev_io->u.flush.offset,
-					 bdev_io->u.flush.length);
+					 bdev_io->u.bdev.offset_blocks * block_size,
+					 bdev_io->u.bdev.num_blocks * block_size);
 
 	case SPDK_BDEV_IO_TYPE_UNMAP:
 		return bdev_malloc_unmap((struct malloc_disk *)bdev_io->bdev->ctxt,
 					 ch,
 					 (struct malloc_task *)bdev_io->driver_ctx,
-					 bdev_io->u.unmap.offset,
-					 bdev_io->u.unmap.len);
+					 bdev_io->u.bdev.offset_blocks * block_size,
+					 bdev_io->u.bdev.num_blocks * block_size);
+
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		/* bdev_malloc_unmap is implemented with a call to mem_cpy_fill which zeroes out all of the requested bytes. */
+		return bdev_malloc_unmap((struct malloc_disk *)bdev_io->bdev->ctxt,
+					 ch,
+					 (struct malloc_task *)bdev_io->driver_ctx,
+					 bdev_io->u.bdev.offset_blocks * block_size,
+					 bdev_io->u.bdev.num_blocks * block_size);
+
 	default:
 		return -1;
 	}
@@ -328,7 +318,7 @@ static int _bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_b
 
 static void bdev_malloc_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	if (_bdev_malloc_submit_request(ch, bdev_io) < 0) {
+	if (_bdev_malloc_submit_request(ch, bdev_io) != 0) {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
@@ -342,6 +332,7 @@ bdev_malloc_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 		return true;
 
 	default:
@@ -355,21 +346,40 @@ bdev_malloc_get_io_channel(void *ctx)
 	return spdk_copy_engine_get_io_channel();
 }
 
+static void
+bdev_malloc_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	char uuid_str[SPDK_UUID_STRING_LEN];
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w, "method", "construct_malloc_bdev");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name", bdev->name);
+	spdk_json_write_named_uint64(w, "num_blocks", bdev->blockcnt);
+	spdk_json_write_named_uint32(w, "block_size", bdev->blocklen);
+	spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &bdev->uuid);
+	spdk_json_write_named_string(w, "uuid", uuid_str);
+
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+}
+
 static const struct spdk_bdev_fn_table malloc_fn_table = {
 	.destruct		= bdev_malloc_destruct,
 	.submit_request		= bdev_malloc_submit_request,
 	.io_type_supported	= bdev_malloc_io_type_supported,
 	.get_io_channel		= bdev_malloc_get_io_channel,
+	.write_config_json	= bdev_malloc_write_json_config,
 };
 
-struct spdk_bdev *create_malloc_disk(uint64_t num_blocks, uint32_t block_size)
+struct spdk_bdev *create_malloc_disk(const char *name, const struct spdk_uuid *uuid,
+				     uint64_t num_blocks, uint32_t block_size)
 {
 	struct malloc_disk	*mdisk;
-
-	if (block_size % 512 != 0) {
-		SPDK_ERRLOG("Block size %u is not a multiple of 512.\n", block_size);
-		return NULL;
-	}
+	int			rc;
 
 	if (num_blocks == 0) {
 		SPDK_ERRLOG("Disk must be more than 0 blocks\n");
@@ -378,7 +388,7 @@ struct spdk_bdev *create_malloc_disk(uint64_t num_blocks, uint32_t block_size)
 
 	mdisk = spdk_dma_zmalloc(sizeof(*mdisk), 0, NULL);
 	if (!mdisk) {
-		perror("mdisk");
+		SPDK_ERRLOG("mdisk spdk_dma_zmalloc() failed\n");
 		return NULL;
 	}
 
@@ -390,40 +400,57 @@ struct spdk_bdev *create_malloc_disk(uint64_t num_blocks, uint32_t block_size)
 	 */
 	mdisk->malloc_buf = spdk_dma_zmalloc(num_blocks * block_size, 2 * 1024 * 1024, NULL);
 	if (!mdisk->malloc_buf) {
-		SPDK_ERRLOG("spdk_dma_zmalloc failed\n");
+		SPDK_ERRLOG("malloc_buf spdk_dma_zmalloc() failed\n");
 		malloc_disk_free(mdisk);
 		return NULL;
 	}
 
-	mdisk->disk.name = spdk_sprintf_alloc("Malloc%d", malloc_disk_count);
+	if (name) {
+		mdisk->disk.name = strdup(name);
+	} else {
+		/* Auto-generate a name */
+		mdisk->disk.name = spdk_sprintf_alloc("Malloc%d", malloc_disk_count);
+		malloc_disk_count++;
+	}
 	if (!mdisk->disk.name) {
 		malloc_disk_free(mdisk);
 		return NULL;
 	}
 	mdisk->disk.product_name = "Malloc disk";
-	malloc_disk_count++;
 
 	mdisk->disk.write_cache = 1;
 	mdisk->disk.blocklen = block_size;
 	mdisk->disk.blockcnt = num_blocks;
+	if (uuid) {
+		mdisk->disk.uuid = *uuid;
+	} else {
+		spdk_uuid_generate(&mdisk->disk.uuid);
+	}
 
 	mdisk->disk.ctxt = mdisk;
 	mdisk->disk.fn_table = &malloc_fn_table;
-	mdisk->disk.module = SPDK_GET_BDEV_MODULE(malloc);
+	mdisk->disk.module = &malloc_if;
 
-	spdk_bdev_register(&mdisk->disk);
+	rc = spdk_bdev_register(&mdisk->disk);
+	if (rc) {
+		malloc_disk_free(mdisk);
+		return NULL;
+	}
 
-	mdisk->next = g_malloc_disk_head;
-	g_malloc_disk_head = mdisk;
+	TAILQ_INSERT_TAIL(&g_malloc_disks, mdisk, link);
 
 	return &mdisk->disk;
 }
 
-static void free_malloc_disk(struct malloc_disk *mdisk)
+void
+delete_malloc_disk(struct spdk_bdev *bdev, spdk_delete_malloc_complete cb_fn, void *cb_arg)
 {
-	free(mdisk->disk.name);
-	spdk_dma_free(mdisk->malloc_buf);
-	spdk_dma_free(mdisk);
+	if (!bdev || bdev->module != &malloc_if) {
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	spdk_bdev_unregister(bdev, cb_fn, cb_arg);
 }
 
 static int bdev_malloc_initialize(void)
@@ -439,7 +466,6 @@ static int bdev_malloc_initialize(void)
 		BlockSize = spdk_conf_section_get_intval(sp, "BlockSize");
 		if ((NumberOfLuns < 1) || (LunSizeInMB < 1)) {
 			SPDK_ERRLOG("Malloc section present, but no devices specified\n");
-			rc = EINVAL;
 			goto end;
 		}
 		if (BlockSize < 1) {
@@ -448,7 +474,7 @@ static int bdev_malloc_initialize(void)
 		}
 		size = (uint64_t)LunSizeInMB * 1024 * 1024;
 		for (i = 0; i < NumberOfLuns; i++) {
-			bdev = create_malloc_disk(size / BlockSize, BlockSize);
+			bdev = create_malloc_disk(NULL, NULL, size / BlockSize, BlockSize);
 			if (bdev == NULL) {
 				SPDK_ERRLOG("Could not create malloc disk\n");
 				rc = EINVAL;
@@ -461,33 +487,21 @@ end:
 	return rc;
 }
 
-static void bdev_malloc_finish(void)
-{
-	struct malloc_disk *mdisk;
-
-	while (g_malloc_disk_head != NULL) {
-		mdisk = g_malloc_disk_head;
-		g_malloc_disk_head = mdisk->next;
-		free_malloc_disk(mdisk);
-	}
-}
-
 static void
 bdev_malloc_get_spdk_running_config(FILE *fp)
 {
 	int num_malloc_luns = 0;
 	uint64_t malloc_lun_size = 0;
+	struct malloc_disk *mdisk;
 
 	/* count number of malloc LUNs, get LUN size */
-	struct malloc_disk *mdisk = g_malloc_disk_head;
-	while (mdisk != NULL) {
+	TAILQ_FOREACH(mdisk, &g_malloc_disks, link) {
 		if (0 == malloc_lun_size) {
 			/* assume all malloc luns the same size */
 			malloc_lun_size = mdisk->disk.blocklen * mdisk->disk.blockcnt;
 			malloc_lun_size /= (1024 * 1024);
 		}
 		num_malloc_luns++;
-		mdisk = mdisk->next;
 	}
 
 	if (num_malloc_luns > 0) {
@@ -495,7 +509,7 @@ bdev_malloc_get_spdk_running_config(FILE *fp)
 			"\n"
 			"# Users may change this section to create a different number or size of\n"
 			"# malloc LUNs.\n"
-			"# This will generate %d LUNs with a malloc-allocated backend. Each LUN \n"
+			"# This will generate %d LUNs with a malloc-allocated backend. Each LUN\n"
 			"# will be %" PRIu64 "MB in size and these will be named Malloc0 through Malloc%d.\n"
 			"# Not all LUNs defined here are necessarily used below.\n"
 			"[Malloc]\n"
@@ -507,4 +521,4 @@ bdev_malloc_get_spdk_running_config(FILE *fp)
 	}
 }
 
-SPDK_LOG_REGISTER_TRACE_FLAG("malloc", SPDK_TRACE_MALLOC)
+SPDK_LOG_REGISTER_COMPONENT("bdev_malloc", SPDK_LOG_BDEV_MALLOC)

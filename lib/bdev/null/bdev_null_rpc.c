@@ -33,21 +33,30 @@
 
 #include "spdk/rpc.h"
 #include "spdk/util.h"
-
-#include "spdk_internal/bdev.h"
+#include "spdk/string.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 
 #include "bdev_null.h"
 
 struct rpc_construct_null {
 	char *name;
-	uint32_t num_blocks;
+	char *uuid;
+	uint64_t num_blocks;
 	uint32_t block_size;
 };
 
+static void
+free_rpc_construct_null(struct rpc_construct_null *req)
+{
+	free(req->name);
+	free(req->uuid);
+}
+
 static const struct spdk_json_object_decoder rpc_construct_null_decoders[] = {
 	{"name", offsetof(struct rpc_construct_null, name), spdk_json_decode_string},
-	{"num_blocks", offsetof(struct rpc_construct_null, num_blocks), spdk_json_decode_uint32},
+	{"uuid", offsetof(struct rpc_construct_null, uuid), spdk_json_decode_string, true},
+	{"num_blocks", offsetof(struct rpc_construct_null, num_blocks), spdk_json_decode_uint64},
 	{"block_size", offsetof(struct rpc_construct_null, block_size), spdk_json_decode_uint32},
 };
 
@@ -57,35 +66,104 @@ spdk_rpc_construct_null_bdev(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_construct_null req = {};
 	struct spdk_json_write_ctx *w;
+	struct spdk_uuid *uuid = NULL;
+	struct spdk_uuid decoded_uuid;
 	struct spdk_bdev *bdev;
 
 	if (spdk_json_decode_object(params, rpc_construct_null_decoders,
 				    SPDK_COUNTOF(rpc_construct_null_decoders),
 				    &req)) {
-		SPDK_TRACELOG(SPDK_TRACE_DEBUG, "spdk_json_decode_object failed\n");
+		SPDK_DEBUGLOG(SPDK_LOG_BDEV_NULL, "spdk_json_decode_object failed\n");
 		goto invalid;
 	}
 
-	bdev = create_null_bdev(req.name, req.num_blocks, req.block_size);
+	if (req.uuid) {
+		if (spdk_uuid_parse(&decoded_uuid, req.uuid)) {
+			goto invalid;
+		}
+		uuid = &decoded_uuid;
+	}
+
+	bdev = create_null_bdev(req.name, uuid, req.num_blocks, req.block_size);
 	if (bdev == NULL) {
 		goto invalid;
 	}
 
 	w = spdk_jsonrpc_begin_result(request);
 	if (w == NULL) {
-		free(req.name);
+		free_rpc_construct_null(&req);
 		return;
 	}
 
-	spdk_json_write_array_begin(w);
 	spdk_json_write_string(w, bdev->name);
-	spdk_json_write_array_end(w);
 	spdk_jsonrpc_end_result(request, w);
-	free(req.name);
+	free_rpc_construct_null(&req);
 	return;
 
 invalid:
 	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
-	free(req.name);
+	free_rpc_construct_null(&req);
 }
-SPDK_RPC_REGISTER("construct_null_bdev", spdk_rpc_construct_null_bdev)
+SPDK_RPC_REGISTER("construct_null_bdev", spdk_rpc_construct_null_bdev, SPDK_RPC_RUNTIME)
+
+struct rpc_delete_null {
+	char *name;
+};
+
+static void
+free_rpc_delete_null(struct rpc_delete_null *req)
+{
+	free(req->name);
+}
+
+static const struct spdk_json_object_decoder rpc_delete_null_decoders[] = {
+	{"name", offsetof(struct rpc_delete_null, name), spdk_json_decode_string},
+};
+
+static void
+_spdk_rpc_delete_null_bdev_cb(void *cb_arg, int bdeverrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	struct spdk_json_write_ctx *w;
+
+	w = spdk_jsonrpc_begin_result(request);
+	if (w == NULL) {
+		return;
+	}
+
+	spdk_json_write_bool(w, bdeverrno == 0);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+static void
+spdk_rpc_delete_null_bdev(struct spdk_jsonrpc_request *request,
+			  const struct spdk_json_val *params)
+{
+	struct rpc_delete_null req = {NULL};
+	struct spdk_bdev *bdev;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_delete_null_decoders,
+				    SPDK_COUNTOF(rpc_delete_null_decoders),
+				    &req)) {
+		rc = -EINVAL;
+		goto invalid;
+	}
+
+	bdev = spdk_bdev_get_by_name(req.name);
+	if (bdev == NULL) {
+		rc = -ENODEV;
+		goto invalid;
+	}
+
+	delete_null_bdev(bdev, _spdk_rpc_delete_null_bdev_cb, request);
+
+	free_rpc_delete_null(&req);
+
+	return;
+
+invalid:
+	free_rpc_delete_null(&req);
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, spdk_strerror(-rc));
+}
+SPDK_RPC_REGISTER("delete_null_bdev", spdk_rpc_delete_null_bdev, SPDK_RPC_RUNTIME)

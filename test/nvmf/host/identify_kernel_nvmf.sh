@@ -2,7 +2,7 @@
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
-source $rootdir/scripts/autotest_common.sh
+source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/nvmf/common.sh
 
 set -e
@@ -21,6 +21,8 @@ subsystemname=nqn.2016-06.io.spdk:testnqn
 modprobe null_blk nr_devices=1
 modprobe nvmet
 modprobe nvmet-rdma
+modprobe nvmet-fc
+modprobe lpfc
 
 if [ ! -d /sys/kernel/config/nvmet/subsystems/$subsystemname ]; then
 	mkdir /sys/kernel/config/nvmet/subsystems/$subsystemname
@@ -45,12 +47,20 @@ echo -n $NVMF_PORT > /sys/kernel/config/nvmet/ports/1/addr_trsvcid
 
 ln -s /sys/kernel/config/nvmet/subsystems/$subsystemname /sys/kernel/config/nvmet/ports/1/subsystems/$subsystemname
 
+sleep 4
+
 $rootdir/examples/nvme/identify/identify -r "\
 	trtype:RDMA \
 	adrfam:IPv4 \
 	traddr:$NVMF_FIRST_TARGET_IP \
 	trsvcid:$NVMF_PORT \
 	subnqn:nqn.2014-08.org.nvmexpress.discovery" -t all
+$rootdir/examples/nvme/identify/identify -r "\
+	trtype:RDMA \
+	adrfam:IPv4 \
+	traddr:$NVMF_FIRST_TARGET_IP \
+	trsvcid:$NVMF_PORT \
+	subnqn:$subsystemname"
 
 rm -rf /sys/kernel/config/nvmet/ports/1/subsystems/$subsystemname
 
@@ -61,6 +71,8 @@ rmdir --ignore-fail-on-non-empty /sys/kernel/config/nvmet/subsystems/$subsystemn
 rmdir --ignore-fail-on-non-empty /sys/kernel/config/nvmet/subsystems/$subsystemname
 rmdir --ignore-fail-on-non-empty /sys/kernel/config/nvmet/ports/1
 
+rmmod lpfc
+rmmod nvmet_fc
 rmmod nvmet-rdma
 rmmod null_blk
 rmmod nvmet

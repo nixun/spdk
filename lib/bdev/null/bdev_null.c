@@ -36,28 +36,40 @@
 #include "spdk/bdev.h"
 #include "spdk/conf.h"
 #include "spdk/env.h"
-#include "spdk/io_channel.h"
+#include "spdk/thread.h"
+#include "spdk/json.h"
 
-#include "spdk_internal/bdev.h"
+#include "spdk/bdev_module.h"
 #include "spdk_internal/log.h"
 
 #include "bdev_null.h"
-
-SPDK_DECLARE_BDEV_MODULE(null);
 
 struct null_bdev {
 	struct spdk_bdev	bdev;
 	TAILQ_ENTRY(null_bdev)	tailq;
 };
 
+struct null_io_channel {
+	struct spdk_poller		*poller;
+	TAILQ_HEAD(, spdk_bdev_io)	io;
+};
+
 static TAILQ_HEAD(, null_bdev) g_null_bdev_head;
 static void *g_null_read_buf;
 
-static int
-bdev_null_get_ctx_size(void)
-{
-	return 0;
-}
+static int bdev_null_initialize(void);
+static void bdev_null_finish(void);
+static void bdev_null_get_spdk_running_config(FILE *fp);
+
+static struct spdk_bdev_module null_if = {
+	.name = "null",
+	.module_init = bdev_null_initialize,
+	.module_fini = bdev_null_finish,
+	.config_text = bdev_null_get_spdk_running_config,
+	.async_fini = true,
+};
+
+SPDK_BDEV_MODULE_REGISTER(&null_if)
 
 static int
 bdev_null_destruct(void *ctx)
@@ -72,20 +84,23 @@ bdev_null_destruct(void *ctx)
 }
 
 static void
-bdev_null_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+bdev_null_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_io)
 {
+	struct null_io_channel *ch = spdk_io_channel_get_ctx(_ch);
+
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-		if (bdev_io->u.read.iovs[0].iov_base == NULL) {
-			assert(bdev_io->u.read.iovcnt == 1);
-			bdev_io->u.read.iovs[0].iov_base = g_null_read_buf;
-			bdev_io->u.read.iovs[0].iov_len = bdev_io->u.read.len;
+		if (bdev_io->u.bdev.iovs[0].iov_base == NULL) {
+			assert(bdev_io->u.bdev.iovcnt == 1);
+			bdev_io->u.bdev.iovs[0].iov_base = g_null_read_buf;
+			bdev_io->u.bdev.iovs[0].iov_len = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
 		}
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		TAILQ_INSERT_TAIL(&ch->io, bdev_io, module_link);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 	case SPDK_BDEV_IO_TYPE_RESET:
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		TAILQ_INSERT_TAIL(&ch->io, bdev_io, module_link);
 		break;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 	case SPDK_BDEV_IO_TYPE_UNMAP:
@@ -101,6 +116,7 @@ bdev_null_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	switch (io_type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 	case SPDK_BDEV_IO_TYPE_RESET:
 		return true;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
@@ -116,17 +132,40 @@ bdev_null_get_io_channel(void *ctx)
 	return spdk_get_io_channel(&g_null_bdev_head);
 }
 
+static void
+bdev_null_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	char uuid_str[SPDK_UUID_STRING_LEN];
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w, "method", "construct_null_bdev");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name", bdev->name);
+	spdk_json_write_named_uint64(w, "num_blocks", bdev->blockcnt);
+	spdk_json_write_named_uint32(w, "block_size", bdev->blocklen);
+	spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &bdev->uuid);
+	spdk_json_write_named_string(w, "uuid", uuid_str);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+}
+
 static const struct spdk_bdev_fn_table null_fn_table = {
 	.destruct		= bdev_null_destruct,
 	.submit_request		= bdev_null_submit_request,
 	.io_type_supported	= bdev_null_io_type_supported,
 	.get_io_channel		= bdev_null_get_io_channel,
+	.write_config_json	= bdev_null_write_config_json,
 };
 
 struct spdk_bdev *
-create_null_bdev(const char *name, uint64_t num_blocks, uint32_t block_size)
+create_null_bdev(const char *name, const struct spdk_uuid *uuid,
+		 uint64_t num_blocks, uint32_t block_size)
 {
 	struct null_bdev *bdev;
+	int rc;
 
 	if (block_size % 512 != 0) {
 		SPDK_ERRLOG("Block size %u is not a multiple of 512.\n", block_size);
@@ -154,27 +193,79 @@ create_null_bdev(const char *name, uint64_t num_blocks, uint32_t block_size)
 	bdev->bdev.write_cache = 0;
 	bdev->bdev.blocklen = block_size;
 	bdev->bdev.blockcnt = num_blocks;
+	if (uuid) {
+		bdev->bdev.uuid = *uuid;
+	} else {
+		spdk_uuid_generate(&bdev->bdev.uuid);
+	}
 
 	bdev->bdev.ctxt = bdev;
 	bdev->bdev.fn_table = &null_fn_table;
-	bdev->bdev.module = SPDK_GET_BDEV_MODULE(null);
+	bdev->bdev.module = &null_if;
 
-	spdk_bdev_register(&bdev->bdev);
+	rc = spdk_bdev_register(&bdev->bdev);
+	if (rc) {
+		free(bdev->bdev.name);
+		spdk_dma_free(bdev);
+		return NULL;
+	}
 
 	TAILQ_INSERT_TAIL(&g_null_bdev_head, bdev, tailq);
 
 	return &bdev->bdev;
 }
 
+void
+delete_null_bdev(struct spdk_bdev *bdev, spdk_delete_null_complete cb_fn, void *cb_arg)
+{
+	if (!bdev || bdev->module != &null_if) {
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	spdk_bdev_unregister(bdev, cb_fn, cb_arg);
+}
+
+static int
+null_io_poll(void *arg)
+{
+	struct null_io_channel		*ch = arg;
+	TAILQ_HEAD(, spdk_bdev_io)	io;
+	struct spdk_bdev_io		*bdev_io;
+
+	TAILQ_INIT(&io);
+	TAILQ_SWAP(&ch->io, &io, spdk_bdev_io, module_link);
+
+	if (TAILQ_EMPTY(&io)) {
+		return 0;
+	}
+
+	while (!TAILQ_EMPTY(&io)) {
+		bdev_io = TAILQ_FIRST(&io);
+		TAILQ_REMOVE(&io, bdev_io, module_link);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	}
+
+	return 1;
+}
+
 static int
 null_bdev_create_cb(void *io_device, void *ctx_buf)
 {
+	struct null_io_channel *ch = ctx_buf;
+
+	TAILQ_INIT(&ch->io);
+	ch->poller = spdk_poller_register(null_io_poll, ch, 0);
+
 	return 0;
 }
 
 static void
 null_bdev_destroy_cb(void *io_device, void *ctx_buf)
 {
+	struct null_io_channel *ch = ctx_buf;
+
+	spdk_poller_unregister(&ch->poller);
 }
 
 static int
@@ -199,7 +290,9 @@ bdev_null_initialize(void)
 	 * We need to pick some unique address as our "io device" - so just use the
 	 *  address of the global tailq.
 	 */
-	spdk_io_device_register(&g_null_bdev_head, null_bdev_create_cb, null_bdev_destroy_cb, 0);
+	spdk_io_device_register(&g_null_bdev_head, null_bdev_create_cb, null_bdev_destroy_cb,
+				sizeof(struct null_io_channel),
+				"null_bdev");
 
 	if (sp == NULL) {
 		goto end;
@@ -245,7 +338,7 @@ bdev_null_initialize(void)
 
 		num_blocks = size_in_mb * (1024 * 1024) / block_size;
 
-		bdev = create_null_bdev(name, num_blocks, block_size);
+		bdev = create_null_bdev(name, NULL, num_blocks, block_size);
 		if (bdev == NULL) {
 			SPDK_ERRLOG("Could not create null bdev\n");
 			rc = EINVAL;
@@ -260,14 +353,16 @@ end:
 }
 
 static void
+_bdev_null_finish_cb(void *arg)
+{
+	spdk_dma_free(g_null_read_buf);
+	spdk_bdev_module_finish_done();
+}
+
+static void
 bdev_null_finish(void)
 {
-	struct null_bdev *bdev, *tmp;
-
-	TAILQ_FOREACH_SAFE(bdev, &g_null_bdev_head, tailq, tmp) {
-		TAILQ_REMOVE(&g_null_bdev_head, bdev, tailq);
-		spdk_dma_free(bdev);
-	}
+	spdk_io_device_unregister(&g_null_bdev_head, _bdev_null_finish_cb);
 }
 
 static void
@@ -286,7 +381,4 @@ bdev_null_get_spdk_running_config(FILE *fp)
 	}
 }
 
-SPDK_BDEV_MODULE_REGISTER(null, bdev_null_initialize, bdev_null_finish,
-			  bdev_null_get_spdk_running_config, bdev_null_get_ctx_size, NULL)
-
-SPDK_LOG_REGISTER_TRACE_FLAG("bdev_null", SPDK_TRACE_BDEV_NULL)
+SPDK_LOG_REGISTER_COMPONENT("bdev_null", SPDK_LOG_BDEV_NULL)

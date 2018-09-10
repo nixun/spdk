@@ -61,15 +61,9 @@ struct hello_context_t {
 static void
 hello_cleanup(struct hello_context_t *hello_context)
 {
-	if (hello_context->read_buff) {
-		spdk_dma_free(hello_context->read_buff);
-	}
-	if (hello_context->write_buff) {
-		spdk_dma_free(hello_context->write_buff);
-	}
-	if (hello_context) {
-		free(hello_context);
-	}
+	spdk_dma_free(hello_context->read_buff);
+	spdk_dma_free(hello_context->write_buff);
+	free(hello_context);
 }
 
 /*
@@ -143,8 +137,8 @@ delete_blob(void *arg1, int bserrno)
 		return;
 	}
 
-	spdk_bs_md_delete_blob(hello_context->bs, hello_context->blobid,
-			       delete_complete, hello_context);
+	spdk_bs_delete_blob(hello_context->bs, hello_context->blobid,
+			    delete_complete, hello_context);
 }
 
 /*
@@ -174,8 +168,7 @@ read_complete(void *arg1, int bserrno)
 	}
 
 	/* Now let's close it and delete the blob in the callback. */
-	spdk_bs_md_close_blob(&hello_context->blob, delete_blob,
-			      hello_context);
+	spdk_blob_close(hello_context->blob, delete_blob, hello_context);
 }
 
 /*
@@ -195,9 +188,9 @@ read_blob(struct hello_context_t *hello_context)
 	}
 
 	/* Issue the read and compare the results in the callback. */
-	spdk_bs_io_read_blob(hello_context->blob, hello_context->channel,
-			     hello_context->read_buff, 0, 1, read_complete,
-			     hello_context);
+	spdk_blob_io_read(hello_context->blob, hello_context->channel,
+			  hello_context->read_buff, 0, 1, read_complete,
+			  hello_context);
 }
 
 /*
@@ -249,9 +242,9 @@ blob_write(struct hello_context_t *hello_context)
 	}
 
 	/* Let's perform the write, 1 page at offset 0. */
-	spdk_bs_io_write_blob(hello_context->blob, hello_context->channel,
-			      hello_context->write_buff,
-			      0, 1, write_complete, hello_context);
+	spdk_blob_io_write(hello_context->blob, hello_context->channel,
+			   hello_context->write_buff,
+			   0, 1, write_complete, hello_context);
 }
 
 /*
@@ -273,6 +266,33 @@ sync_complete(void *arg1, int bserrno)
 	blob_write(hello_context);
 }
 
+static void
+resize_complete(void *cb_arg, int bserrno)
+{
+	struct hello_context_t *hello_context = cb_arg;
+	uint64_t total = 0;
+
+	if (bserrno) {
+		unload_bs(hello_context, "Error in blob resize", bserrno);
+		return;
+	}
+
+	total = spdk_blob_get_num_clusters(hello_context->blob);
+	SPDK_NOTICELOG("resized blob now has USED clusters of %" PRIu64 "\n",
+		       total);
+
+	/*
+	 * Metadata is stored in volatile memory for performance
+	 * reasons and therefore needs to be synchronized with
+	 * non-volatile storage to make it persistent. This can be
+	 * done manually, as shown here, or if not it will be done
+	 * automatically when the blob is closed. It is always a
+	 * good idea to sync after making metadata changes unless
+	 * it has an unacceptable impact on application performance.
+	 */
+	spdk_blob_sync_md(hello_context->blob, sync_complete, hello_context);
+}
+
 /*
  * Callback function for opening a blob.
  */
@@ -281,8 +301,6 @@ open_complete(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
 	struct hello_context_t *hello_context = cb_arg;
 	uint64_t free = 0;
-	uint64_t total = 0;
-	int rc = 0;
 
 	SPDK_NOTICELOG("entry\n");
 	if (bserrno) {
@@ -304,28 +322,7 @@ open_complete(void *cb_arg, struct spdk_blob *blob, int bserrno)
 	 * there'd usually be many blobs of various sizes. The resize
 	 * unit is a cluster.
 	 */
-	rc = spdk_bs_md_resize_blob(hello_context->blob, free);
-	if (rc) {
-		unload_bs(hello_context, "Error in blob resize",
-			  bserrno);
-		return;
-	}
-
-	total = spdk_blob_get_num_clusters(hello_context->blob);
-	SPDK_NOTICELOG("resized blob now has USED clusters of %" PRIu64 "\n",
-		       total);
-
-	/*
-	 * Metadata is stored in volatile memory for performance
-	 * reasons and therefore needs to be synchronized with
-	 * non-volatile storage to make it persistent. This can be
-	 * done manually, as shown here, or if not it will be done
-	 * automatically when the blob is closed. It is always a
-	 * good idea to sync after making metadata changes unless
-	 * it has an unacceptable impact on application performance.
-	 */
-	spdk_bs_md_sync_blob(hello_context->blob, sync_complete,
-			     hello_context);
+	spdk_blob_resize(hello_context->blob, free, resize_complete, hello_context);
 }
 
 /*
@@ -347,8 +344,8 @@ blob_create_complete(void *arg1, spdk_blob_id blobid, int bserrno)
 	SPDK_NOTICELOG("new blob id %" PRIu64 "\n", hello_context->blobid);
 
 	/* We have to open the blob before we can do things like resize. */
-	spdk_bs_md_open_blob(hello_context->bs, hello_context->blobid,
-			     open_complete, hello_context);
+	spdk_bs_open_blob(hello_context->bs, hello_context->blobid,
+			  open_complete, hello_context);
 }
 
 /*
@@ -358,8 +355,7 @@ static void
 create_blob(struct hello_context_t *hello_context)
 {
 	SPDK_NOTICELOG("entry\n");
-	spdk_bs_md_create_blob(hello_context->bs, blob_create_complete,
-			       hello_context);
+	spdk_bs_create_blob(hello_context->bs, blob_create_complete, hello_context);
 }
 
 /*
@@ -388,10 +384,9 @@ bs_init_complete(void *cb_arg, struct spdk_blob_store *bs,
 
 	/*
 	 * The blostore has been initialized, let's create a blob.
-	 * Note that we could allcoate an SPDK event and use
-	 * spdk_event_call() to schedule it if we wanted to keep
-	 * our events as limited as possible wrt the amount of
-	 * work that they do.
+	 * Note that we could pass a message back to ourselves using
+	 * spdk_thread_send_msg() if we wanted to keep our processing
+	 * time limited.
 	 */
 	create_blob(hello_context);
 }
@@ -433,7 +428,7 @@ hello_start(void *arg1, void *arg2)
 	 * However blobstore can be more tightly integrated into
 	 * any lower layer, such as NVMe for example.
 	 */
-	bs_dev = spdk_bdev_create_bs_dev(bdev);
+	bs_dev = spdk_bdev_create_bs_dev(bdev, NULL, NULL);
 	if (bs_dev == NULL) {
 		SPDK_ERRLOG("Could not create blob bdev!!\n");
 		spdk_app_stop(-1);
@@ -479,7 +474,8 @@ main(int argc, char **argv)
 		/*
 		 * spdk_app_start() will block running hello_start() until
 		 * spdk_app_stop() is called by someone (not simply when
-		 * hello_start() returns)
+		 * hello_start() returns), or if an error occurs during
+		 * spdk_app_start() before hello_start() runs.
 		 */
 		rc = spdk_app_start(&opts, hello_start, hello_context, NULL);
 		if (rc) {

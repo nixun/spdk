@@ -35,76 +35,18 @@
 
 #include "spdk_cunit.h"
 
-#include "lib/test_env.c"
+#include "common/lib/test_env.c"
+
+pid_t g_spdk_nvme_pid;
 
 bool trace_flag = false;
-#define SPDK_TRACE_NVME trace_flag
+#define SPDK_LOG_NVME trace_flag
 
 #include "nvme/nvme_qpair.c"
 
 struct nvme_driver _g_nvme_driver = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 };
-
-struct nvme_request *
-nvme_allocate_request(struct spdk_nvme_qpair *qpair,
-		      const struct nvme_payload *payload, uint32_t payload_size,
-		      spdk_nvme_cmd_cb cb_fn,
-		      void *cb_arg)
-{
-	struct nvme_request *req;
-
-	req = STAILQ_FIRST(&qpair->free_req);
-	if (req == NULL) {
-		return NULL;
-	}
-
-	STAILQ_REMOVE_HEAD(&qpair->free_req, stailq);
-
-	/*
-	 * Only memset up to (but not including) the children
-	 *  TAILQ_ENTRY.  children, and following members, are
-	 *  only used as part of I/O splitting so we avoid
-	 *  memsetting them until it is actually needed.
-	 *  They will be initialized in nvme_request_add_child()
-	 *  if the request is split.
-	 */
-	memset(req, 0, offsetof(struct nvme_request, children));
-	req->cb_fn = cb_fn;
-	req->cb_arg = cb_arg;
-	req->payload = *payload;
-	req->payload_size = payload_size;
-	req->qpair = qpair;
-	req->pid = getpid();
-
-	return req;
-}
-
-struct nvme_request *
-nvme_allocate_request_contig(struct spdk_nvme_qpair *qpair, void *buffer, uint32_t payload_size,
-			     spdk_nvme_cmd_cb cb_fn, void *cb_arg)
-{
-	struct nvme_payload payload;
-
-	payload.type = NVME_PAYLOAD_TYPE_CONTIG;
-	payload.u.contig = buffer;
-
-	return nvme_allocate_request(qpair, &payload, payload_size, cb_fn, cb_arg);
-}
-
-struct nvme_request *
-nvme_allocate_request_null(struct spdk_nvme_qpair *qpair, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
-{
-	return nvme_allocate_request_contig(qpair, NULL, 0, cb_fn, cb_arg);
-}
-
-void
-nvme_free_request(struct nvme_request *req)
-{
-	SPDK_CU_ASSERT_FATAL(req != NULL);
-	SPDK_CU_ASSERT_FATAL(req->qpair != NULL);
-	STAILQ_INSERT_HEAD(&req->qpair->free_req, req, stailq);
-}
 
 void
 nvme_request_remove_child(struct nvme_request *parent,
@@ -336,6 +278,16 @@ static void test_nvme_completion_is_retry(void)
 	cpl.status.sct = SPDK_NVME_SCT_MEDIA_ERROR;
 	CU_ASSERT_FALSE(nvme_completion_is_retry(&cpl));
 
+	cpl.status.sct = SPDK_NVME_SCT_PATH;
+	cpl.status.sc = SPDK_NVME_SC_INTERNAL_PATH_ERROR;
+	cpl.status.dnr = 0;
+	CU_ASSERT_TRUE(nvme_completion_is_retry(&cpl));
+
+	cpl.status.sct = SPDK_NVME_SCT_PATH;
+	cpl.status.sc = SPDK_NVME_SC_INTERNAL_PATH_ERROR;
+	cpl.status.dnr = 1;
+	CU_ASSERT_FALSE(nvme_completion_is_retry(&cpl));
+
 	cpl.status.sct = SPDK_NVME_SCT_VENDOR_SPECIFIC;
 	CU_ASSERT_FALSE(nvme_completion_is_retry(&cpl));
 
@@ -367,6 +319,66 @@ test_get_status_string(void)
 }
 #endif
 
+static void
+test_nvme_qpair_add_cmd_error_injection(void)
+{
+	struct spdk_nvme_qpair qpair = {};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	int rc;
+
+	prepare_submit_request_test(&qpair, &ctrlr);
+	ctrlr.adminq = &qpair;
+
+	/* Admin error injection at submission path */
+	rc = spdk_nvme_qpair_add_cmd_error_injection(&ctrlr, NULL,
+			SPDK_NVME_OPC_GET_FEATURES, true, 5000, 1,
+			SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INVALID_FIELD);
+
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(!TAILQ_EMPTY(&qpair.err_cmd_head));
+
+	/* Remove cmd error injection */
+	spdk_nvme_qpair_remove_cmd_error_injection(&ctrlr, NULL, SPDK_NVME_OPC_GET_FEATURES);
+
+	CU_ASSERT(TAILQ_EMPTY(&qpair.err_cmd_head));
+
+	/* IO error injection at completion path */
+	rc = spdk_nvme_qpair_add_cmd_error_injection(&ctrlr, &qpair,
+			SPDK_NVME_OPC_READ, false, 0, 1,
+			SPDK_NVME_SCT_MEDIA_ERROR, SPDK_NVME_SC_UNRECOVERED_READ_ERROR);
+
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(!TAILQ_EMPTY(&qpair.err_cmd_head));
+
+	/* Provide the same opc, and check whether allocate a new entry */
+	rc = spdk_nvme_qpair_add_cmd_error_injection(&ctrlr, &qpair,
+			SPDK_NVME_OPC_READ, false, 0, 1,
+			SPDK_NVME_SCT_MEDIA_ERROR, SPDK_NVME_SC_UNRECOVERED_READ_ERROR);
+
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&qpair.err_cmd_head));
+	CU_ASSERT(TAILQ_NEXT(TAILQ_FIRST(&qpair.err_cmd_head), link) == NULL);
+
+	/* Remove cmd error injection */
+	spdk_nvme_qpair_remove_cmd_error_injection(&ctrlr, &qpair, SPDK_NVME_OPC_READ);
+
+	CU_ASSERT(TAILQ_EMPTY(&qpair.err_cmd_head));
+
+	rc = spdk_nvme_qpair_add_cmd_error_injection(&ctrlr, &qpair,
+			SPDK_NVME_OPC_COMPARE, true, 0, 5,
+			SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_COMPARE_FAILURE);
+
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(!TAILQ_EMPTY(&qpair.err_cmd_head));
+
+	/* Remove cmd error injection */
+	spdk_nvme_qpair_remove_cmd_error_injection(&ctrlr, &qpair, SPDK_NVME_OPC_COMPARE);
+
+	CU_ASSERT(TAILQ_EMPTY(&qpair.err_cmd_head));
+
+	cleanup_submit_request_test(&qpair);
+}
+
 int main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
@@ -391,6 +403,8 @@ int main(int argc, char **argv)
 #ifdef DEBUG
 	    || CU_add_test(suite, "get_status_string", test_get_status_string) == NULL
 #endif
+	    || CU_add_test(suite, "spdk_nvme_qpair_add_cmd_error_injection",
+			   test_nvme_qpair_add_cmd_error_injection) == NULL
 	   ) {
 		CU_cleanup_registry();
 		return CU_get_error();

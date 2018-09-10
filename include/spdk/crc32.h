@@ -1,7 +1,6 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (C) 2008-2012 Daisuke Aoyama <aoyama@peach.ne.jp>.
  *   Copyright (c) Intel Corporation.
  *   All rights reserved.
  *
@@ -41,6 +40,10 @@
 #define SPDK_CRC32_H
 
 #include "spdk/stdinc.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /**
  * IEEE CRC-32 polynomial (bit reflected)
@@ -97,5 +100,9 @@ uint32_t spdk_crc32_ieee_update(const void *buf, size_t len, uint32_t crc);
  * \return Updated CRC-32C value.
  */
 uint32_t spdk_crc32c_update(const void *buf, size_t len, uint32_t crc);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SPDK_CRC32_H */

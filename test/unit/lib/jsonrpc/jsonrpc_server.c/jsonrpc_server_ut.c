@@ -35,7 +35,7 @@
 
 #include "spdk_cunit.h"
 
-#include "jsonrpc_server.c"
+#include "jsonrpc/jsonrpc_server.c"
 
 #define MAX_PARAMS	100
 #define MAX_REQS	100
@@ -61,14 +61,21 @@ static size_t g_num_reqs;
 	memcpy(g_buf, in, sizeof(in) - 1); \
 	g_num_reqs = 0; \
 	g_cur_req = NULL; \
-	CU_ASSERT(spdk_jsonrpc_parse_request(conn, g_buf, sizeof(in) - 1) == sizeof(in) - sizeof(trailing))
+	CU_ASSERT(spdk_jsonrpc_parse_request(conn, g_buf, sizeof(in) - 1) == sizeof(in) - sizeof(trailing)); \
+	if (g_cur_req && g_cur_req->request) { \
+		free(g_cur_req->request->send_buf); \
+		g_cur_req->request->send_buf = NULL; \
+	}
 
 #define PARSE_FAIL(in) \
 	memcpy(g_buf, in, sizeof(in) - 1); \
 	g_num_reqs = 0; \
 	g_cur_req = 0; \
-	CU_ASSERT(spdk_jsonrpc_parse_request(conn, g_buf, sizeof(in) - 1) < 0)
-
+	CU_ASSERT(spdk_jsonrpc_parse_request(conn, g_buf, sizeof(in) - 1) < 0); \
+	if (g_cur_req && g_cur_req->request) { \
+		free(g_cur_req->request->send_buf); \
+		g_cur_req->request->send_buf = NULL; \
+	}
 
 #define REQ_BEGIN(expected_error) \
 	if (g_cur_req == NULL) { \
@@ -148,6 +155,9 @@ static size_t g_num_reqs;
 	g_params++
 
 #define FREE_REQUEST() \
+	if (g_reqs->request) { \
+		free(g_reqs->request->send_buf); \
+	} \
 	free(g_reqs->request); \
 	g_reqs->request = NULL
 
@@ -209,8 +219,7 @@ spdk_jsonrpc_server_handle_request(struct spdk_jsonrpc_request *request,
 }
 
 void
-spdk_jsonrpc_server_send_response(struct spdk_jsonrpc_server_conn *conn,
-				  struct spdk_jsonrpc_request *request)
+spdk_jsonrpc_server_send_response(struct spdk_jsonrpc_request *request)
 {
 	/* TODO */
 }
@@ -361,7 +370,8 @@ test_parse_request_streaming(void)
 	FREE_REQUEST();
 
 	/* Partial (but not invalid) requests - parse should not consume anything. */
-	strcpy(g_buf, "{\"jsonrpc\":\"2.0\",\"method\":\"b\",\"params\":[2],\"id\":2}");
+	snprintf(g_buf, sizeof(g_buf), "%s",
+		 "{\"jsonrpc\":\"2.0\",\"method\":\"b\",\"params\":[2],\"id\":2}");
 	len = strlen(g_buf);
 
 	/* Try every partial length up to the full request length */

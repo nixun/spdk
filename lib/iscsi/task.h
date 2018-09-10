@@ -37,9 +37,12 @@
 
 #include "iscsi/iscsi.h"
 #include "spdk/scsi.h"
+#include "spdk/util.h"
 
 struct spdk_iscsi_task {
 	struct spdk_scsi_task	scsi;
+
+	struct spdk_iscsi_task *parent;
 
 	struct spdk_iscsi_conn *conn;
 	struct spdk_iscsi_pdu *pdu;
@@ -84,10 +87,17 @@ struct spdk_iscsi_task {
 
 	uint32_t tag;
 
+	/**
+	 * Record the lun id just in case the lun is invalid,
+	 * which will happen when hot removing the lun.
+	 */
+	int lun_id;
+
 	TAILQ_ENTRY(spdk_iscsi_task) link;
 
 	TAILQ_HEAD(subtask_list, spdk_iscsi_task) subtask_list;
 	TAILQ_ENTRY(spdk_iscsi_task) subtask_link;
+	bool is_queued; /* is queued in scsi layer for handling */
 };
 
 static inline void
@@ -161,18 +171,17 @@ struct spdk_iscsi_task *spdk_iscsi_task_get(struct spdk_iscsi_conn *conn,
 static inline struct spdk_iscsi_task *
 spdk_iscsi_task_from_scsi_task(struct spdk_scsi_task *task)
 {
-	return (struct spdk_iscsi_task *)((uintptr_t)task - offsetof(struct spdk_iscsi_task, scsi));
+	return SPDK_CONTAINEROF(task, struct spdk_iscsi_task, scsi);
 }
 
 static inline struct spdk_iscsi_task *
 spdk_iscsi_task_get_primary(struct spdk_iscsi_task *task)
 {
-	struct spdk_scsi_task *scsi_task;
-	struct spdk_scsi_task *scsi_primary_task;
-
-	scsi_task = &task->scsi;
-	scsi_primary_task = spdk_scsi_task_get_primary(scsi_task);
-	return spdk_iscsi_task_from_scsi_task(scsi_primary_task);
+	if (task->parent) {
+		return task->parent;
+	} else {
+		return task;
+	}
 }
 
 #endif /* SPDK_ISCSI_TASK_H */

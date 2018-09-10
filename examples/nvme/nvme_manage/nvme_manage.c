@@ -41,7 +41,7 @@
 
 struct dev {
 	struct spdk_pci_addr			pci_addr;
-	struct spdk_nvme_ctrlr 			*ctrlr;
+	struct spdk_nvme_ctrlr			*ctrlr;
 	const struct spdk_nvme_ctrlr_data	*cdata;
 	struct spdk_nvme_ns_data		*common_ns_data;
 	int					outstanding_admin_cmds;
@@ -194,8 +194,9 @@ display_namespace(struct spdk_nvme_ns *ns)
 	       (long long)nsdata->nuse / 1024 / 1024);
 	printf("Format Progress Indicator:   %s\n",
 	       nsdata->fpi.fpi_supported ? "Supported" : "Not Supported");
-	if (nsdata->fpi.fpi_supported && nsdata->fpi.percentage_remaining)
+	if (nsdata->fpi.fpi_supported && nsdata->fpi.percentage_remaining) {
 		printf("Formatted Percentage:	%d%%\n", 100 - nsdata->fpi.percentage_remaining);
+	}
 	printf("Number of LBA Formats:       %d\n", nsdata->nlbaf + 1);
 	printf("Current LBA Format:          LBA Format #%02d\n",
 	       nsdata->flbas.format);
@@ -314,7 +315,7 @@ get_controller(void)
 		display_controller(iter, CONTROLLER_DISPLAY_SIMPLISTIC);
 	}
 
-	printf("Please Input PCI Address(domain:bus:dev.func): \n");
+	printf("Please Input PCI Address(domain:bus:dev.func):\n");
 
 	while ((ch = getchar()) != '\n' && ch != EOF);
 	p = get_line(address, 64, stdin);
@@ -408,7 +409,7 @@ get_allocated_nsid(struct dev *dev)
 
 	spdk_dma_free(ns_list);
 
-	printf("Please Input Namespace ID: \n");
+	printf("Please Input Namespace ID:\n");
 	if (!scanf("%u", &nsid)) {
 		printf("Invalid Namespace ID\n");
 		nsid = 0;
@@ -539,9 +540,9 @@ add_ns(void)
 	uint64_t	ns_size		= 0;
 	uint64_t	ns_capacity	= 0;
 	int		ns_lbasize;
-	int 		ns_dps_type  	= 0;
-	int 		ns_dps_location = 0;
-	int	 	ns_nmic 	= 0;
+	int		ns_dps_type	= 0;
+	int		ns_dps_location	= 0;
+	int		ns_nmic		= 0;
 	struct dev	*ctrlr		= NULL;
 
 	ctrlr = get_controller();
@@ -566,21 +567,21 @@ add_ns(void)
 		return;
 	}
 
-	printf("Please Input Namespace Size (in LBAs): \n");
-	if (!scanf("%" SCNi64, &ns_size)) {
+	printf("Please Input Namespace Size (in LBAs):\n");
+	if (!scanf("%" SCNu64, &ns_size)) {
 		printf("Invalid Namespace Size\n");
 		while (getchar() != '\n');
 		return;
 	}
 
-	printf("Please Input Namespace Capacity (in LBAs): \n");
-	if (!scanf("%" SCNi64, &ns_capacity)) {
+	printf("Please Input Namespace Capacity (in LBAs):\n");
+	if (!scanf("%" SCNu64, &ns_capacity)) {
 		printf("Invalid Namespace Capacity\n");
 		while (getchar() != '\n');
 		return;
 	}
 
-	printf("Please Input Data Protection Type (0 - 3): \n");
+	printf("Please Input Data Protection Type (0 - 3):\n");
 	if (!scanf("%d", &ns_dps_type)) {
 		printf("Invalid Data Protection Type\n");
 		while (getchar() != '\n');
@@ -588,7 +589,7 @@ add_ns(void)
 	}
 
 	if (SPDK_NVME_FMT_NVM_PROTECTION_DISABLE != ns_dps_type) {
-		printf("Please Input Data Protection Location (1: Head; 0: Tail): \n");
+		printf("Please Input Data Protection Location (1: Head; 0: Tail):\n");
 		if (!scanf("%d", &ns_dps_location)) {
 			printf("Invalid Data Protection Location\n");
 			while (getchar() != '\n');
@@ -596,7 +597,7 @@ add_ns(void)
 		}
 	}
 
-	printf("Please Input Multi-path IO and Sharing Capabilities (1: Share; 0: Private): \n");
+	printf("Please Input Multi-path IO and Sharing Capabilities (1: Share; 0: Private):\n");
 	if (!scanf("%d", &ns_nmic)) {
 		printf("Invalid Multi-path IO and Sharing Capabilities\n");
 		while (getchar() != '\n');
@@ -610,7 +611,7 @@ add_ns(void)
 static void
 delete_ns(void)
 {
-	int 					ns_id;
+	int					ns_id;
 	struct dev				*ctrlr;
 
 	ctrlr = get_controller();
@@ -624,7 +625,7 @@ delete_ns(void)
 		return;
 	}
 
-	printf("Please Input Namespace ID: \n");
+	printf("Please Input Namespace ID:\n");
 	if (!scanf("%d", &ns_id)) {
 		printf("Invalid Namespace ID\n");
 		while (getchar() != '\n');
@@ -637,7 +638,7 @@ delete_ns(void)
 static void
 format_nvm(void)
 {
-	int 					ns_id;
+	int					ns_id;
 	int					ses;
 	int					pil;
 	int					pi;
@@ -666,7 +667,7 @@ format_nvm(void)
 		ns_id = SPDK_NVME_GLOBAL_NS_TAG;
 		ns = spdk_nvme_ctrlr_get_ns(ctrlr->ctrlr, 1);
 	} else {
-		printf("Please Input Namespace ID (1 - %d): \n", cdata->nn);
+		printf("Please Input Namespace ID (1 - %d):\n", cdata->nn);
 		if (!scanf("%d", &ns_id)) {
 			printf("Invalid Namespace ID\n");
 			while (getchar() != '\n');
@@ -683,7 +684,7 @@ format_nvm(void)
 
 	nsdata = spdk_nvme_ns_get_data(ns);
 
-	printf("Please Input Secure Erase Setting: \n");
+	printf("Please Input Secure Erase Setting:\n");
 	printf("	0: No secure erase operation requested\n");
 	printf("	1: User data erase\n");
 	if (cdata->fna.crypto_erase_supported) {
@@ -702,7 +703,7 @@ format_nvm(void)
 	}
 
 	if (nsdata->lbaf[lbaf].ms) {
-		printf("Please Input Protection Information: \n");
+		printf("Please Input Protection Information:\n");
 		printf("	0: Protection information is not enabled\n");
 		printf("	1: Protection information is enabled, Type 1\n");
 		printf("	2: Protection information is enabled, Type 2\n");
@@ -714,7 +715,7 @@ format_nvm(void)
 		}
 
 		if (pi) {
-			printf("Please Input Protection Information Location: \n");
+			printf("Please Input Protection Information Location:\n");
 			printf("	0: Protection information transferred as the last eight bytes of metadata\n");
 			printf("	1: Protection information transferred as the first eight bytes of metadata\n");
 			if (!scanf("%d", &pil)) {
@@ -726,7 +727,7 @@ format_nvm(void)
 			pil = 0;
 		}
 
-		printf("Please Input Metadata Setting: \n");
+		printf("Please Input Metadata Setting:\n");
 		printf("	0: Metadata is transferred as part of a separate buffer\n");
 		printf("	1: Metadata is transferred as part of an extended data LBA\n");
 		if (!scanf("%d", &ms)) {
@@ -831,7 +832,7 @@ update_firmware_image(void)
 	}
 	close(fd);
 
-	printf("Please Input Slot(0 - 7): \n");
+	printf("Please Input Slot(0 - 7):\n");
 	if (!scanf("%d", &slot)) {
 		printf("Invalid Slot\n");
 		spdk_dma_free(fw_image);
@@ -894,7 +895,10 @@ int main(int argc, char **argv)
 	opts.name = "nvme_manage";
 	opts.core_mask = "0x1";
 	opts.shm_id = g_shm_id;
-	spdk_env_init(&opts);
+	if (spdk_env_init(&opts) < 0) {
+		fprintf(stderr, "Unable to initialize SPDK env\n");
+		return 1;
+	}
 
 	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");
@@ -910,9 +914,10 @@ int main(int argc, char **argv)
 		bool exit_flag = false;
 
 		if (!scanf("%d", &cmd)) {
-			printf("Invalid Command\n");
+			printf("Invalid Command: command must be number 1-8\n");
 			while (getchar() != '\n');
-			return 0;
+			usage();
+			continue;
 		}
 		switch (cmd) {
 		case 1:
@@ -944,8 +949,9 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		if (exit_flag)
+		if (exit_flag) {
 			break;
+		}
 
 		while (getchar() != '\n');
 		printf("press Enter to display cmd menu ...\n");
