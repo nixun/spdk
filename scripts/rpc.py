@@ -59,49 +59,39 @@ if __name__ == "__main__":
     @call_cmd
     def save_config(args):
         rpc.save_config(args.client,
-                        filename=args.filename,
                         indent=args.indent)
 
-    p = subparsers.add_parser('save_config', help="""Write current (live) configuration of SPDK subsystems and targets.
-    If no filename is given write configuration to stdout.""")
-    p.add_argument('-f', '--filename', help="""File where to save JSON configuration to.""")
-    p.add_argument('-i', '--indent', help="""Indent level. Value less than 0 mean compact mode. If filename is not given default
-    indent level is 2. If writing to file of filename is '-' then default is compact mode.""", type=int, default=2)
+    p = subparsers.add_parser('save_config', help="""Write current (live) configuration of SPDK subsystems and targets to stdout.
+    """)
+    p.add_argument('-i', '--indent', help="""Indent level. Value less than 0 mean compact mode. Default indent level is 2.
+    """, type=int, default=2)
     p.set_defaults(func=save_config)
 
     @call_cmd
     def load_config(args):
-        rpc.load_config(args.client,
-                        filename=args.filename)
+        rpc.load_config(args.client)
 
-    p = subparsers.add_parser('load_config', help="""Configure SPDK subsystems and tagets using JSON RPC. If no file is
-    provided or file is '-' read configuration from stdin.""")
-    p.add_argument('-f', '--filename', help="""JSON Configuration file.""")
+    p = subparsers.add_parser('load_config', help="""Configure SPDK subsystems and targets using JSON RPC read from stdin.""")
     p.set_defaults(func=load_config)
 
     @call_cmd
     def save_subsystem_config(args):
         rpc.save_subsystem_config(args.client,
-                                  filename=args.filename,
                                   indent=args.indent,
                                   name=args.name)
 
-    p = subparsers.add_parser('save_subsystem_config', help="""Write current (live) configuration of SPDK subsystem.
-    If no filename is given write configuration to stdout.""")
-    p.add_argument('-f', '--filename', help='File where to save JSON configuration to.')
-    p.add_argument('-i', '--indent', help="""Indent level. Value less than 0 mean compact mode. If filename is not given default
-    indent level is 2. If writing to file of filename is '-' then default is compact mode.""", type=int, default=2)
+    p = subparsers.add_parser('save_subsystem_config', help="""Write current (live) configuration of SPDK subsystem to stdout.
+    """)
+    p.add_argument('-i', '--indent', help="""Indent level. Value less than 0 mean compact mode. Default indent level is 2.
+    """, type=int, default=2)
     p.add_argument('-n', '--name', help='Name of subsystem', required=True)
     p.set_defaults(func=save_subsystem_config)
 
     @call_cmd
     def load_subsystem_config(args):
-        rpc.load_subsystem_config(args.client,
-                                  filename=args.filename)
+        rpc.load_subsystem_config(args.client)
 
-    p = subparsers.add_parser('load_subsystem_config', help="""Configure SPDK subsystem using JSON RPC. If no file is
-    provided or file is '-' read configuration from stdin.""")
-    p.add_argument('-f', '--filename', help="""JSON Configuration file.""")
+    p = subparsers.add_parser('load_subsystem_config', help="""Configure SPDK subsystem using JSON RPC read from stdin.""")
     p.set_defaults(func=load_subsystem_config)
 
     # app
@@ -1248,10 +1238,15 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     @call_cmd
     def set_nvmf_target_config(args):
         rpc.nvmf.set_nvmf_target_config(args.client,
-                                        acceptor_poll_rate=args.acceptor_poll_rate)
+                                        acceptor_poll_rate=args.acceptor_poll_rate,
+                                        conn_sched=args.conn_sched)
 
     p = subparsers.add_parser('set_nvmf_target_config', help='Set NVMf target config')
     p.add_argument('-r', '--acceptor-poll-rate', help='Polling interval of the acceptor for incoming connections (usec)', type=int)
+    p.add_argument('-s', '--conn-sched', help="""'roundrobin' - Schedule the incoming connections from any host
+    on the cores in a round robin manner (Default). 'hostip' - Schedule all the incoming connections from a
+    specific host IP on to the same core. Connections from different IP will be assigned to cores in a round
+    robin manner""")
     p.set_defaults(func=set_nvmf_target_config)
 
     @call_cmd
@@ -1323,6 +1318,24 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument("-m", "--max-namespaces", help="Maximum number of namespaces allowed to added during active connection",
                    type=int, default=0)
     p.set_defaults(func=construct_nvmf_subsystem)
+
+    @call_cmd
+    def nvmf_subsystem_create(args):
+        rpc.nvmf.nvmf_subsystem_create(args.client,
+                                       nqn=args.nqn,
+                                       serial_number=args.serial_number,
+                                       allow_any_host=args.allow_any_host,
+                                       max_namespaces=args.max_namespaces)
+
+    p = subparsers.add_parser('nvmf_subsystem_create', help='Create an NVMe-oF subsystem')
+    p.add_argument('nqn', help='Subsystem NQN (ASCII)')
+    p.add_argument("-s", "--serial-number", help="""
+    Format:  'sn' etc
+    Example: 'SPDK00000000000001'""", default='0000:00:01.0')
+    p.add_argument("-a", "--allow-any-host", action='store_true', help="Allow any host to connect (don't enforce host NQN whitelist)")
+    p.add_argument("-m", "--max-namespaces", help="Maximum number of namespaces allowed",
+                   type=int, default=0)
+    p.set_defaults(func=nvmf_subsystem_create)
 
     @call_cmd
     def delete_nvmf_subsystem(args):

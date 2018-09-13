@@ -37,11 +37,14 @@ def set_nvmf_target_options(client,
     return client.call('set_nvmf_target_options', params)
 
 
-def set_nvmf_target_config(client, acceptor_poll_rate=None):
+def set_nvmf_target_config(client,
+                           acceptor_poll_rate=None,
+                           conn_sched=None):
     """Set NVMe-oF target subsystem configuration.
 
     Args:
         acceptor_poll_rate: Acceptor poll period in microseconds (optional)
+        conn_sched: Scheduling of incoming connections (optional)
 
     Returns:
         True or False
@@ -50,6 +53,8 @@ def set_nvmf_target_config(client, acceptor_poll_rate=None):
 
     if acceptor_poll_rate:
         params['acceptor_poll_rate'] = acceptor_poll_rate
+    if conn_sched:
+        params['conn_sched'] = conn_sched
     return client.call('set_nvmf_target_config', params)
 
 
@@ -105,6 +110,38 @@ def construct_nvmf_subsystem(client,
         params['namespaces'] = namespaces
 
     return client.call('construct_nvmf_subsystem', params)
+
+
+def nvmf_subsystem_create(client,
+                          nqn,
+                          serial_number,
+                          allow_any_host=False,
+                          max_namespaces=0):
+    """Construct an NVMe over Fabrics target subsystem.
+
+    Args:
+        nqn: Subsystem NQN.
+        serial_number: Serial number of virtual controller.
+        allow_any_host: Allow any host (True) or enforce allowed host whitelist (False). Default: False.
+        max_namespaces: Maximum number of namespaces that can be attached to the subsystem (optional). Default: 0 (Unlimited).
+
+    Returns:
+        True or False
+    """
+    params = {
+        'nqn': nqn,
+    }
+
+    if serial_number:
+        params['serial_number'] = serial_number
+
+    if allow_any_host:
+        params['allow_any_host'] = True
+
+    if max_namespaces:
+        params['max_namespaces'] = max_namespaces
+
+    return client.call('nvmf_subsystem_create', params)
 
 
 def nvmf_subsystem_add_listener(client, nqn, trtype, traddr, trsvcid, adrfam):

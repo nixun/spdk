@@ -36,6 +36,7 @@ fi
 
 # Set defaults for missing test config options
 : ${SPDK_BUILD_DOC=1}; export SPDK_BUILD_DOC
+: ${SPDK_BUILD_SHARED_OBJECT=1}; export SPDK_BUILD_SHARED_OBJECT
 : ${SPDK_RUN_CHECK_FORMAT=1}; export SPDK_RUN_CHECK_FORMAT
 : ${SPDK_RUN_SCANBUILD=1}; export SPDK_RUN_SCANBUILD
 : ${SPDK_RUN_VALGRIND=1}; export SPDK_RUN_VALGRIND
@@ -263,6 +264,30 @@ function process_core() {
 	return $ret
 }
 
+function process_shm() {
+	type=$1
+	id=$2
+	if [ "$type" = "--pid" ]; then
+		id="pid${id}"
+	elif [ "$type" = "--id" ]; then
+		id="${id}"
+	else
+		echo "Please specify to search for pid or shared memory id."
+		return 1
+	fi
+
+	shm_files=$(find /dev/shm -name "*.${id}" -printf "%f\n")
+
+	if [[ -z $shm_files ]]; then
+		echo "SHM File for specified PID or shared memory id: ${id} not found!"
+		return 1
+	fi
+	for n in $shm_files; do
+		tar -C /dev/shm/ -cvzf $output_dir/${n}_shm.tar.gz ${n}
+	done
+	return 0
+}
+
 function waitforlisten() {
 	# $1 = process pid
 	if [ -z "$1" ]; then
@@ -337,9 +362,11 @@ function killprocess() {
 		exit 1
 	fi
 
-	echo "killing process with pid $1"
-	kill $1
-	wait $1
+	if kill -0 $1; then
+		echo "killing process with pid $1"
+		kill $1
+		wait $1
+	fi
 }
 
 function iscsicleanup() {
@@ -649,6 +676,7 @@ function get_bdev_size()
 function autotest_cleanup()
 {
 	$rootdir/scripts/setup.sh reset
+	$rootdir/scripts/setup.sh cleanup
 }
 
 function freebsd_update_contigmem_mod()

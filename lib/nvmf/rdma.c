@@ -233,6 +233,7 @@ struct spdk_nvmf_rdma_qpair {
 	struct spdk_nvmf_rdma_poller		*poller;
 
 	struct rdma_cm_id			*cm_id;
+	struct rdma_cm_id			*listen_id;
 
 	/* The maximum number of I/O outstanding on this connection at one time */
 	uint16_t				max_queue_depth;
@@ -288,6 +289,15 @@ struct spdk_nvmf_rdma_qpair {
 	struct ibv_qp_attr			ibv_attr;
 
 	bool					qpair_disconnected;
+
+	/* Reference counter for how many unprocessed messages
+	 * from other threads are currently outstanding. The
+	 * qpair cannot be destroyed until this is 0. This is
+	 * atomically incremented from any thread, but only
+	 * decremented and read from the thread that owns this
+	 * qpair.
+	 */
+	uint32_t				refcnt;
 };
 
 struct spdk_nvmf_rdma_poller {
@@ -347,6 +357,26 @@ struct spdk_nvmf_rdma_mgmt_channel {
 	/* Requests that are waiting to obtain a data buffer */
 	TAILQ_HEAD(, spdk_nvmf_rdma_request)	pending_data_buf_queue;
 };
+
+static inline void
+spdk_nvmf_rdma_qpair_inc_refcnt(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	__sync_fetch_and_add(&rqpair->refcnt, 1);
+}
+
+static inline uint32_t
+spdk_nvmf_rdma_qpair_dec_refcnt(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	uint32_t old_refcnt, new_refcnt;
+
+	do {
+		old_refcnt = rqpair->refcnt;
+		assert(old_refcnt > 0);
+		new_refcnt = old_refcnt - 1;
+	} while (__sync_bool_compare_and_swap(&rqpair->refcnt, old_refcnt, new_refcnt) == false);
+
+	return new_refcnt;
+}
 
 /* API to IBV QueuePair */
 static const char *str_ibv_qp_state[] = {
@@ -530,6 +560,10 @@ spdk_nvmf_rdma_qpair_destroy(struct spdk_nvmf_rdma_qpair *rqpair)
 
 	if (spdk_nvmf_rdma_cur_queue_depth(rqpair)) {
 		rqpair->qpair_disconnected = true;
+		return;
+	}
+
+	if (rqpair->refcnt > 0) {
 		return;
 	}
 
@@ -951,6 +985,7 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 	rqpair->max_queue_depth = max_queue_depth;
 	rqpair->max_rw_depth = max_rw_depth;
 	rqpair->cm_id = event->id;
+	rqpair->listen_id = event->listen_id;
 	rqpair->qpair.transport = transport;
 	rqpair->max_sge = spdk_min(port->device->attr.max_sge, SPDK_NVMF_MAX_SGL_ENTRIES);
 	TAILQ_INIT(&rqpair->incoming_queue);
@@ -965,6 +1000,11 @@ static void
 _nvmf_rdma_disconnect(void *ctx)
 {
 	struct spdk_nvmf_qpair *qpair = ctx;
+	struct spdk_nvmf_rdma_qpair *rqpair;
+
+	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
+
+	spdk_nvmf_rdma_qpair_dec_refcnt(rqpair);
 
 	spdk_nvmf_qpair_disconnect(qpair, NULL, NULL);
 }
@@ -989,6 +1029,8 @@ nvmf_rdma_disconnect(struct rdma_cm_event *evt)
 	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
 	spdk_trace_record(TRACE_RDMA_QP_DISCONNECT, 0, 0, (uintptr_t)rqpair->cm_id, 0);
 	spdk_nvmf_rdma_update_ibv_state(rqpair);
+
+	spdk_nvmf_rdma_qpair_inc_refcnt(rqpair);
 
 	spdk_thread_send_msg(qpair->group->thread, _nvmf_rdma_disconnect, qpair);
 
@@ -1845,6 +1887,7 @@ spdk_nvmf_rdma_listen(struct spdk_nvmf_transport *transport,
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = family;
+	hints.ai_flags = AI_NUMERICSERV;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = 0;
 
@@ -2142,6 +2185,8 @@ _spdk_nvmf_rdma_qp_error(void *arg)
 	struct spdk_nvmf_rdma_qpair	*rqpair = arg;
 	enum ibv_qp_state		state;
 
+	spdk_nvmf_rdma_qpair_dec_refcnt(rqpair);
+
 	state = rqpair->ibv_attr.qp_state;
 	if (state != IBV_QPS_ERR) {
 		/* Error was already recovered */
@@ -2164,6 +2209,8 @@ _spdk_nvmf_rdma_qp_last_wqe(void *arg)
 {
 	struct spdk_nvmf_rdma_qpair	*rqpair = arg;
 	enum ibv_qp_state		state;
+
+	spdk_nvmf_rdma_qpair_dec_refcnt(rqpair);
 
 	state = rqpair->ibv_attr.qp_state;
 	if (state != IBV_QPS_ERR) {
@@ -2201,19 +2248,21 @@ spdk_nvmf_process_ib_event(struct spdk_nvmf_rdma_device *device)
 	SPDK_NOTICELOG("Async event: %s\n",
 		       ibv_event_type_str(event.event_type));
 
-	rqpair = event.element.qp->qp_context;
-
 	switch (event.event_type) {
 	case IBV_EVENT_QP_FATAL:
+		rqpair = event.element.qp->qp_context;
 		spdk_trace_record(TRACE_RDMA_IBV_ASYNC_EVENT, 0, 0,
 				  (uintptr_t)rqpair->cm_id, event.event_type);
 		spdk_nvmf_rdma_update_ibv_state(rqpair);
+		spdk_nvmf_rdma_qpair_inc_refcnt(rqpair);
 		spdk_thread_send_msg(rqpair->qpair.group->thread, _spdk_nvmf_rdma_qp_error, rqpair);
 		break;
 	case IBV_EVENT_QP_LAST_WQE_REACHED:
+		rqpair = event.element.qp->qp_context;
 		spdk_trace_record(TRACE_RDMA_IBV_ASYNC_EVENT, 0, 0,
 				  (uintptr_t)rqpair->cm_id, event.event_type);
 		spdk_nvmf_rdma_update_ibv_state(rqpair);
+		spdk_nvmf_rdma_qpair_inc_refcnt(rqpair);
 		spdk_thread_send_msg(rqpair->qpair.group->thread, _spdk_nvmf_rdma_qp_last_wqe, rqpair);
 		break;
 	case IBV_EVENT_SQ_DRAINED:
@@ -2222,10 +2271,12 @@ spdk_nvmf_process_ib_event(struct spdk_nvmf_rdma_device *device)
 		 * Note that we're not on the correct thread to access the qpair, but
 		 * the operations that the below calls make all happen to be thread
 		 * safe. */
+		rqpair = event.element.qp->qp_context;
 		spdk_trace_record(TRACE_RDMA_IBV_ASYNC_EVENT, 0, 0,
 				  (uintptr_t)rqpair->cm_id, event.event_type);
 		state = spdk_nvmf_rdma_update_ibv_state(rqpair);
 		if (state == IBV_QPS_ERR) {
+			spdk_nvmf_rdma_qpair_inc_refcnt(rqpair);
 			spdk_thread_send_msg(rqpair->qpair.group->thread, _spdk_nvmf_rdma_qp_error, rqpair);
 		}
 		break;
@@ -2234,6 +2285,7 @@ spdk_nvmf_process_ib_event(struct spdk_nvmf_rdma_device *device)
 	case IBV_EVENT_COMM_EST:
 	case IBV_EVENT_PATH_MIG:
 	case IBV_EVENT_PATH_MIG_ERR:
+		rqpair = event.element.qp->qp_context;
 		spdk_trace_record(TRACE_RDMA_IBV_ASYNC_EVENT, 0, 0,
 				  (uintptr_t)rqpair->cm_id, event.event_type);
 		spdk_nvmf_rdma_update_ibv_state(rqpair);
@@ -2588,7 +2640,7 @@ spdk_nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 				rdma_req = get_rdma_req_from_wc(&wc[i]);
 				rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
 
-				/* We're going to kill the connection, so force the request into
+				/* We're going to attempt an error recovery, so force the request into
 				 * the completed state. */
 				spdk_nvmf_rdma_request_set_state(rdma_req, RDMA_REQUEST_STATE_COMPLETED);
 				spdk_nvmf_rdma_request_process(rtransport, rdma_req);
@@ -2598,17 +2650,16 @@ spdk_nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 				rqpair = rdma_recv->qpair;
 
 				/* Dump this into the incoming queue. This gets cleaned up when
-				 * the queue pair disconnects. */
+				 * the queue pair disconnects or recovers. */
 				TAILQ_INSERT_TAIL(&rqpair->incoming_queue, rdma_recv, link);
+				break;
 			default:
 				SPDK_ERRLOG("Received an unknown opcode on the CQ: %d\n", wc[i].opcode);
 				continue;
 			}
 
-			/* Begin disconnecting the qpair. This is ok to call multiple times if lots of
-			 * errors occur on the same qpair in the same ibv_poll_cq batch. */
-			spdk_nvmf_qpair_disconnect(&rqpair->qpair, NULL, NULL);
-
+			/* Set the qpair to the error state. This will initiate a recovery. */
+			spdk_nvmf_rdma_set_ibv_state(rqpair, IBV_QPS_ERR);
 			continue;
 		}
 
@@ -2694,17 +2745,20 @@ spdk_nvmf_rdma_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 }
 
 static int
-spdk_nvmf_rdma_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
-				   struct spdk_nvme_transport_id *trid)
+spdk_nvmf_rdma_trid_from_cm_id(struct rdma_cm_id *id,
+			       struct spdk_nvme_transport_id *trid,
+			       bool peer)
 {
-	struct spdk_nvmf_rdma_qpair	*rqpair;
 	struct sockaddr *saddr;
-
-	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
+	uint16_t port;
 
 	trid->trtype = SPDK_NVME_TRANSPORT_RDMA;
 
-	saddr = rdma_get_peer_addr(rqpair->cm_id);
+	if (peer) {
+		saddr = rdma_get_peer_addr(id);
+	} else {
+		saddr = rdma_get_local_addr(id);
+	}
 	switch (saddr->sa_family) {
 	case AF_INET: {
 		struct sockaddr_in *saddr_in = (struct sockaddr_in *)saddr;
@@ -2712,7 +2766,12 @@ spdk_nvmf_rdma_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
 		trid->adrfam = SPDK_NVMF_ADRFAM_IPV4;
 		inet_ntop(AF_INET, &saddr_in->sin_addr,
 			  trid->traddr, sizeof(trid->traddr));
-		snprintf(trid->trsvcid, sizeof(trid->trsvcid), "%u", saddr_in->sin_port);
+		if (peer) {
+			port = ntohs(rdma_get_dst_port(id));
+		} else {
+			port = ntohs(rdma_get_src_port(id));
+		}
+		snprintf(trid->trsvcid, sizeof(trid->trsvcid), "%u", port);
 		break;
 	}
 	case AF_INET6: {
@@ -2720,7 +2779,12 @@ spdk_nvmf_rdma_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
 		trid->adrfam = SPDK_NVMF_ADRFAM_IPV6;
 		inet_ntop(AF_INET6, &saddr_in->sin6_addr,
 			  trid->traddr, sizeof(trid->traddr));
-		snprintf(trid->trsvcid, sizeof(trid->trsvcid), "%u", saddr_in->sin6_port);
+		if (peer) {
+			port = ntohs(rdma_get_dst_port(id));
+		} else {
+			port = ntohs(rdma_get_src_port(id));
+		}
+		snprintf(trid->trsvcid, sizeof(trid->trsvcid), "%u", port);
 		break;
 	}
 	default:
@@ -2729,6 +2793,39 @@ spdk_nvmf_rdma_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
 	}
 
 	return 0;
+}
+
+static int
+spdk_nvmf_rdma_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
+				   struct spdk_nvme_transport_id *trid)
+{
+	struct spdk_nvmf_rdma_qpair	*rqpair;
+
+	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
+
+	return spdk_nvmf_rdma_trid_from_cm_id(rqpair->cm_id, trid, true);
+}
+
+static int
+spdk_nvmf_rdma_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
+				    struct spdk_nvme_transport_id *trid)
+{
+	struct spdk_nvmf_rdma_qpair	*rqpair;
+
+	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
+
+	return spdk_nvmf_rdma_trid_from_cm_id(rqpair->cm_id, trid, false);
+}
+
+static int
+spdk_nvmf_rdma_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
+				     struct spdk_nvme_transport_id *trid)
+{
+	struct spdk_nvmf_rdma_qpair	*rqpair;
+
+	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
+
+	return spdk_nvmf_rdma_trid_from_cm_id(rqpair->listen_id, trid, false);
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma = {
@@ -2753,6 +2850,8 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma = {
 	.qpair_fini = spdk_nvmf_rdma_close_qpair,
 	.qpair_is_idle = spdk_nvmf_rdma_qpair_is_idle,
 	.qpair_get_peer_trid = spdk_nvmf_rdma_qpair_get_peer_trid,
+	.qpair_get_local_trid = spdk_nvmf_rdma_qpair_get_local_trid,
+	.qpair_get_listen_trid = spdk_nvmf_rdma_qpair_get_listen_trid,
 
 };
 

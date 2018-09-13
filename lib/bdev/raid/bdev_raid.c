@@ -282,7 +282,7 @@ raid_bdev_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 
 /*
  * brief:
- * raid_bdev_submit_children function is used to submit I/O to the correct
+ * raid_bdev_submit_rw_request function is used to submit I/O to the correct
  * member disk
  * params:
  * bdev_io - parent bdev io
@@ -292,12 +292,11 @@ raid_bdev_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
  * non zero - failure
  */
 static int
-raid_bdev_submit_children(struct spdk_bdev_io *bdev_io, uint64_t start_strip)
+raid_bdev_submit_rw_request(struct spdk_bdev_io *bdev_io, uint64_t start_strip)
 {
 	struct raid_bdev_io		*raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
 	struct raid_bdev_io_channel	*raid_ch = spdk_io_channel_get_ctx(raid_io->ch);
 	struct raid_bdev		*raid_bdev = (struct raid_bdev *)bdev_io->bdev->ctxt;
-	uint8_t				*buf = bdev_io->u.bdev.iovs->iov_base;
 	uint64_t			pd_strip;
 	uint32_t			offset_in_strip;
 	uint64_t			pd_lba;
@@ -321,15 +320,17 @@ raid_bdev_submit_children(struct spdk_bdev_io *bdev_io, uint64_t start_strip)
 	 * function and function callback context
 	 */
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
-		ret = spdk_bdev_read_blocks(raid_bdev->base_bdev_info[pd_idx].desc,
-					    raid_ch->base_channel[pd_idx],
-					    buf, pd_lba, pd_blocks, raid_bdev_io_completion,
-					    bdev_io);
-	} else if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
-		ret = spdk_bdev_write_blocks(raid_bdev->base_bdev_info[pd_idx].desc,
+		ret = spdk_bdev_readv_blocks(raid_bdev->base_bdev_info[pd_idx].desc,
 					     raid_ch->base_channel[pd_idx],
-					     buf, pd_lba, pd_blocks, raid_bdev_io_completion,
+					     bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+					     pd_lba, pd_blocks, raid_bdev_io_completion,
 					     bdev_io);
+	} else if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+		ret = spdk_bdev_writev_blocks(raid_bdev->base_bdev_info[pd_idx].desc,
+					      raid_ch->base_channel[pd_idx],
+					      bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+					      pd_lba, pd_blocks, raid_bdev_io_completion,
+					      bdev_io);
 	} else {
 		SPDK_ERRLOG("Recvd not supported io type %u\n", bdev_io->type);
 		assert(0);
@@ -421,7 +422,7 @@ raid_bdev_waitq_io_process(void *ctx)
 	 */
 	raid_bdev = (struct raid_bdev *)bdev_io->bdev->ctxt;
 	start_strip = bdev_io->u.bdev.offset_blocks >> raid_bdev->strip_size_shift;
-	ret = raid_bdev_submit_children(bdev_io, start_strip);
+	ret = raid_bdev_submit_rw_request(bdev_io, start_strip);
 	if (ret != 0) {
 		raid_bdev_io_submit_fail_process(raid_bdev, bdev_io, raid_io, ret);
 	}
@@ -429,7 +430,7 @@ raid_bdev_waitq_io_process(void *ctx)
 
 /*
  * brief:
- * _raid_bdev_submit_rw_request function is the submit_request function for
+ * raid_bdev_start_rw_request function is the submit_request function for
  * read/write requests
  * params:
  * ch - pointer to raid bdev io channel
@@ -438,7 +439,7 @@ raid_bdev_waitq_io_process(void *ctx)
  * none
  */
 static void
-_raid_bdev_submit_rw_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+raid_bdev_start_rw_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct raid_bdev_io		*raid_io;
 	struct raid_bdev		*raid_bdev;
@@ -446,30 +447,121 @@ _raid_bdev_submit_rw_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 	uint64_t			end_strip = 0;
 	int				ret;
 
-	if (bdev_io->u.bdev.iovcnt != 1) {
-		SPDK_ERRLOG("iov vector count is not 1\n");
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
-	}
-
-	/*
-	 * IO parameters used during io split and io completion
-	 */
 	raid_bdev = (struct raid_bdev *)bdev_io->bdev->ctxt;
 	raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
 	raid_io->ch = ch;
 	start_strip = bdev_io->u.bdev.offset_blocks >> raid_bdev->strip_size_shift;
 	end_strip = (bdev_io->u.bdev.offset_blocks + bdev_io->u.bdev.num_blocks - 1) >>
 		    raid_bdev->strip_size_shift;
-	if (start_strip != end_strip) {
+	if (start_strip != end_strip && raid_bdev->num_base_bdevs > 1) {
 		assert(false);
 		SPDK_ERRLOG("I/O spans strip boundary!\n");
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
 	}
-	ret = raid_bdev_submit_children(bdev_io, start_strip);
+	ret = raid_bdev_submit_rw_request(bdev_io, start_strip);
 	if (ret != 0) {
 		raid_bdev_io_submit_fail_process(raid_bdev, bdev_io, raid_io, ret);
 	}
+}
+
+/*
+ * brief:
+ * raid_bdev_reset_completion is the completion callback for member disk resets
+ * params:
+ * bdev_io - pointer to member disk reset bdev_io
+ * success - true if reset was successful, false if unsuccessful
+ * cb_arg - callback argument (parent reset bdev_io)
+ * returns:
+ * none
+ */
+static void
+raid_bdev_reset_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_bdev_io *parent_io = cb_arg;
+	struct raid_bdev *raid_bdev = (struct raid_bdev *)parent_io->bdev->ctxt;
+	struct raid_bdev_io *raid_io = (struct raid_bdev_io *)parent_io->driver_ctx;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		raid_io->base_bdev_reset_status = SPDK_BDEV_IO_STATUS_FAILED;
+	}
+
+	raid_io->base_bdev_reset_completed++;
+	if (raid_io->base_bdev_reset_completed == raid_bdev->num_base_bdevs) {
+		spdk_bdev_io_complete(parent_io, raid_io->base_bdev_reset_status);
+	}
+}
+
+/*
+ * brief:
+ * _raid_bdev_submit_reset_request_next function submits the next batch of reset requests
+ * to member disks; it will submit as many as possible unless a reset fails with -ENOMEM, in
+ * which case it will queue it for later submission
+ * params:
+ * bdev_io - pointer to parent bdev_io on raid bdev device
+ * returns:
+ * none
+ */
+static void
+_raid_bdev_submit_reset_request_next(void *_bdev_io)
+{
+	struct spdk_bdev_io		*bdev_io = _bdev_io;
+	struct raid_bdev_io		*raid_io;
+	struct raid_bdev		*raid_bdev;
+	struct raid_bdev_io_channel	*raid_ch;
+	int				ret;
+	uint8_t				i;
+
+	raid_bdev = (struct raid_bdev *)bdev_io->bdev->ctxt;
+	raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
+	raid_ch = spdk_io_channel_get_ctx(raid_io->ch);
+
+	while (raid_io->base_bdev_reset_submitted < raid_bdev->num_base_bdevs) {
+		i = raid_io->base_bdev_reset_submitted;
+		ret = spdk_bdev_reset(raid_bdev->base_bdev_info[i].desc,
+				      raid_ch->base_channel[i],
+				      raid_bdev_reset_completion, bdev_io);
+		if (ret == 0) {
+			raid_io->base_bdev_reset_submitted++;
+		} else if (ret == -ENOMEM) {
+			raid_io->waitq_entry.bdev = raid_bdev->base_bdev_info[i].bdev;
+			raid_io->waitq_entry.cb_fn = _raid_bdev_submit_reset_request_next;
+			raid_io->waitq_entry.cb_arg = bdev_io;
+			spdk_bdev_queue_io_wait(raid_bdev->base_bdev_info[i].bdev,
+						raid_ch->base_channel[i],
+						&raid_io->waitq_entry);
+			return;
+		} else {
+			assert(false);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+	}
+}
+
+/*
+ * brief:
+ * _raid_bdev_submit_reset_request function is the submit_request function for
+ * reset requests
+ * params:
+ * ch - pointer to raid bdev io channel
+ * bdev_io - pointer to parent bdev_io on raid bdev device
+ * returns:
+ * none
+ */
+static void
+_raid_bdev_submit_reset_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	struct raid_bdev_io		*raid_io;
+
+	raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
+	raid_io->ch = ch;
+	raid_io->base_bdev_reset_submitted = 0;
+	raid_io->base_bdev_reset_completed = 0;
+	raid_io->base_bdev_reset_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+	_raid_bdev_submit_reset_request_next(bdev_io);
 }
 
 /*
@@ -489,20 +581,24 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		if (bdev_io->u.bdev.iovs[0].iov_base == NULL) {
-			spdk_bdev_io_get_buf(bdev_io, _raid_bdev_submit_rw_request,
+			spdk_bdev_io_get_buf(bdev_io, raid_bdev_start_rw_request,
 					     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		} else {
 			/* Just call it directly if iov_base is already populated. */
-			_raid_bdev_submit_rw_request(ch, bdev_io);
+			raid_bdev_start_rw_request(ch, bdev_io);
 		}
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
-		_raid_bdev_submit_rw_request(ch, bdev_io);
+		raid_bdev_start_rw_request(ch, bdev_io);
 		break;
 
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		// TODO: support flush if requirement comes
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		break;
+
+	case SPDK_BDEV_IO_TYPE_RESET:
+		_raid_bdev_submit_reset_request(ch, bdev_io);
 		break;
 
 	default:
@@ -532,6 +628,7 @@ raid_bdev_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_READ:
 	case SPDK_BDEV_IO_TYPE_WRITE:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
+	case SPDK_BDEV_IO_TYPE_RESET:
 		return true;
 	default:
 		return false;
@@ -654,6 +751,27 @@ raid_bdev_free(void)
 	}
 }
 
+/* brief
+ * raid_bdev_config_find_by_name is a helper function to find raid bdev config
+ * by name as key.
+ *
+ * params:
+ * raid_name - name for raid bdev.
+ */
+struct raid_bdev_config *
+raid_bdev_config_find_by_name(const char *raid_name)
+{
+	struct raid_bdev_config *raid_cfg;
+
+	TAILQ_FOREACH(raid_cfg, &g_spdk_raid_config.raid_bdev_config_head, link) {
+		if (!strcmp(raid_cfg->name, raid_name)) {
+			return raid_cfg;
+		}
+	}
+
+	return raid_cfg;
+}
+
 /*
  * brief
  * raid_bdev_config_add function adds config for newly created raid bdev.
@@ -671,12 +789,11 @@ raid_bdev_config_add(const char *raid_name, int strip_size, int num_base_bdevs,
 {
 	struct raid_bdev_config *raid_cfg;
 
-	TAILQ_FOREACH(raid_cfg, &g_spdk_raid_config.raid_bdev_config_head, link) {
-		if (!strcmp(raid_cfg->name, raid_name)) {
-			SPDK_ERRLOG("Duplicate raid bdev name found in config file %s\n",
-				    raid_name);
-			return -EEXIST;
-		}
+	raid_cfg = raid_bdev_config_find_by_name(raid_name);
+	if (raid_cfg != NULL) {
+		SPDK_ERRLOG("Duplicate raid bdev name found in config file %s\n",
+			    raid_name);
+		return -EEXIST;
 	}
 
 	if (spdk_u32_is_pow2(strip_size) == false) {
@@ -845,6 +962,19 @@ raid_bdev_parse_raid(struct spdk_conf_section *conf_section)
 		raid_bdev_config_cleanup(raid_cfg);
 		SPDK_ERRLOG("Number of devices mentioned is less than count\n");
 		return -EINVAL;
+	}
+
+	rc = raid_bdev_create(raid_cfg);
+	if (rc != 0) {
+		raid_bdev_config_cleanup(raid_cfg);
+		SPDK_ERRLOG("Failed to create raid bdev\n");
+		return rc;
+	}
+
+	rc = raid_bdev_add_base_devices(raid_cfg);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to add any base bdev to raid bdev\n");
+		/* Config is not removed in this case. */
 	}
 
 	return 0;
@@ -1017,13 +1147,12 @@ raid_bdev_init(void)
  * raid_bdev_create allocates raid bdev based on passed configuration
  * params:
  * raid_cfg - configuration of raid bdev
- * _raid_bdev - pointer to created raid bdev
  * returns:
  * 0 - success
  * non zero - failure
  */
-static int
-raid_bdev_create(struct raid_bdev_config *raid_cfg, struct raid_bdev **_raid_bdev)
+int
+raid_bdev_create(struct raid_bdev_config *raid_cfg)
 {
 	struct raid_bdev *raid_bdev;
 	struct spdk_bdev *raid_bdev_gen;
@@ -1034,6 +1163,7 @@ raid_bdev_create(struct raid_bdev_config *raid_cfg, struct raid_bdev **_raid_bde
 		return -ENOMEM;
 	}
 
+	assert(raid_cfg->num_base_bdevs != 0);
 	raid_bdev->num_base_bdevs = raid_cfg->num_base_bdevs;
 	raid_bdev->base_bdev_info = calloc(raid_bdev->num_base_bdevs,
 					   sizeof(struct raid_base_bdev_info));
@@ -1065,7 +1195,7 @@ raid_bdev_create(struct raid_bdev_config *raid_cfg, struct raid_bdev **_raid_bde
 	TAILQ_INSERT_TAIL(&g_spdk_raid_bdev_configuring_list, raid_bdev, state_link);
 	TAILQ_INSERT_TAIL(&g_spdk_raid_bdev_list, raid_bdev, global_link);
 
-	*_raid_bdev = raid_bdev;
+	raid_cfg->raid_bdev = raid_bdev;
 
 	return 0;
 }
@@ -1162,8 +1292,14 @@ raid_bdev_configure(struct raid_bdev *raid_bdev)
 	raid_bdev->strip_size = (raid_bdev->strip_size * 1024) / blocklen;
 	raid_bdev->strip_size_shift = spdk_u32log2(raid_bdev->strip_size);
 	raid_bdev->blocklen_shift = spdk_u32log2(blocklen);
-	raid_bdev_gen->optimal_io_boundary = raid_bdev->strip_size;
-	raid_bdev_gen->split_on_optimal_io_boundary = true;
+	if (raid_bdev->num_base_bdevs > 1) {
+		raid_bdev_gen->optimal_io_boundary = raid_bdev->strip_size;
+		raid_bdev_gen->split_on_optimal_io_boundary = true;
+	} else {
+		/* Do not need to split reads/writes on single bdev RAID modules. */
+		raid_bdev_gen->optimal_io_boundary = 0;
+		raid_bdev_gen->split_on_optimal_io_boundary = false;
+	}
 
 	/*
 	 * RAID bdev logic is for striping so take the minimum block count based
@@ -1306,7 +1442,7 @@ raid_bdev_remove_base_bdev(void *ctx)
  * 0 - success
  * non zero - failure
  */
-int
+static int
 raid_bdev_add_base_device(struct raid_bdev_config *raid_cfg, struct spdk_bdev *bdev,
 			  uint32_t base_bdev_slot)
 {
@@ -1315,12 +1451,8 @@ raid_bdev_add_base_device(struct raid_bdev_config *raid_cfg, struct spdk_bdev *b
 
 	raid_bdev = raid_cfg->raid_bdev;
 	if (!raid_bdev) {
-		rc = raid_bdev_create(raid_cfg, &raid_bdev);
-		if (rc != 0) {
-			SPDK_ERRLOG("Failed to create raid bdev for bdev '%s'\n", bdev->name);
-			return rc;
-		}
-		raid_cfg->raid_bdev = raid_bdev;
+		SPDK_ERRLOG("Raid bdev is not created yet '%s'\n", bdev->name);
+		return -ENODEV;
 	}
 
 	rc = raid_bdev_alloc_base_bdev_resource(raid_bdev, bdev, base_bdev_slot);
@@ -1340,6 +1472,49 @@ raid_bdev_add_base_device(struct raid_bdev_config *raid_cfg, struct spdk_bdev *b
 	}
 
 	return 0;
+}
+
+/*
+ * brief:
+ * Add base bdevs to the raid bdev one by one.  Skip any base bdev which doesn't
+ *  exist or fails to add. If all base bdevs are successfully added, the raid bdev
+ *  moves to the configured state and becomes available. Otherwise, the raid bdev
+ *  stays at the configuring state with added base bdevs.
+ * params:
+ * raid_cfg - pointer to raid bdev config
+ * returns:
+ * 0 - The raid bdev moves to the configured state or stays at the configuring
+ *     state with added base bdevs due to any nonexistent base bdev.
+ * non zero - Failed to add any base bdev and stays at the configuring state with
+ *            added base bdevs.
+ */
+int
+raid_bdev_add_base_devices(struct raid_bdev_config *raid_cfg)
+{
+	struct spdk_bdev	*base_bdev;
+	uint8_t			i;
+	int			rc = 0, _rc;
+
+	for (i = 0; i < raid_cfg->num_base_bdevs; i++) {
+		base_bdev = spdk_bdev_get_by_name(raid_cfg->base_bdev[i].name);
+		if (base_bdev == NULL) {
+			SPDK_DEBUGLOG(SPDK_LOG_BDEV_RAID, "base bdev %s doesn't exist now\n",
+				      raid_cfg->base_bdev[i].name);
+			continue;
+		}
+
+		_rc = raid_bdev_add_base_device(raid_cfg, base_bdev, i);
+		if (_rc != 0) {
+			SPDK_ERRLOG("Failed to add base bdev %s to RAID bdev %s: %s",
+				    raid_cfg->base_bdev[i].name, raid_cfg->name,
+				    spdk_strerror(-rc));
+			if (rc == 0) {
+				rc = _rc;
+			}
+		}
+	}
+
+	return rc;
 }
 
 /*
